@@ -34,7 +34,12 @@ from ..utils.scope_state import (
     get_scope_state,
     get_scope_state_from_update,
 )
-from ..utils.telegram_send import normalize_message_thread_id, send_message_resilient
+from ..utils.telegram_send import (
+    is_private_chat_type,
+    normalize_message_thread_id,
+    send_message_draft_resilient,
+    send_message_resilient,
+)
 
 logger = structlog.get_logger()
 
@@ -917,7 +922,9 @@ class _MessageStatusReactionController:
             return
         self._finished = True
         self._cancel_scheduled_tasks()
-        await self._set_emoji(_BOT_REACTION_EMOJIS["done"], force=True, reset_stall=False)
+        await self._set_emoji(
+            _BOT_REACTION_EMOJIS["done"], force=True, reset_stall=False
+        )
 
     async def set_error(self) -> None:
         if not self._enabled:
@@ -2173,6 +2180,15 @@ async def handle_text_message(
         # Read but don't consume yet -- consume only after successful execution
         # so that the protection survives retries on failure.
         force_new_session = scope_state.get("force_new_session", False)
+        resolved_chat_type = getattr(effective_chat, "type", None)
+        current_message_thread_id = getattr(telegram_message, "message_thread_id", None)
+        draft_stream_enabled = is_private_chat_type(resolved_chat_type)
+        draft_stream_failed = False
+        last_draft_stream_text = ""
+        draft_seed = input_message_id if isinstance(input_message_id, int) else 0
+        if draft_seed <= 0:
+            draft_seed = int(time.time() * 1000) % 2147483647
+        draft_id = draft_seed or 1
 
         # Enhanced stream updates handler with accumulated progress tracking
         progress_lines: list[str] = []
@@ -2294,10 +2310,43 @@ async def handle_text_message(
         async def stream_handler(update_obj: Any) -> None:
             nonlocal progress_msg, last_progress_text, pending_progress_text
             nonlocal last_progress_edit_ts
+            nonlocal draft_stream_failed, last_draft_stream_text
             try:
                 await _update_stream_reaction_status(reaction_controller, update_obj)
+                sent_draft_for_update = False
+                if (
+                    draft_stream_enabled
+                    and not draft_stream_failed
+                    and update_obj.type == "assistant"
+                    and update_obj.content
+                    and not update_obj.tool_calls
+                ):
+                    draft_text = str(update_obj.content or "").strip()
+                    if draft_text and draft_text != last_draft_stream_text:
+                        try:
+                            sent_draft_for_update = await send_message_draft_resilient(
+                                bot=context.bot,
+                                chat_id=input_chat_id,
+                                draft_id=draft_id,
+                                text=draft_text,
+                                message_thread_id=current_message_thread_id,
+                                chat_type=resolved_chat_type,
+                            )
+                            if sent_draft_for_update:
+                                last_draft_stream_text = draft_text
+                        except Exception as draft_error:
+                            draft_stream_failed = True
+                            logger.info(
+                                "sendMessageDraft unavailable, fallback to edit_text",
+                                user_id=user_id,
+                                chat_id=input_chat_id,
+                                error=str(draft_error),
+                            )
+
                 progress_text = await _format_progress_update(update_obj)
                 if not progress_text:
+                    return
+                if sent_draft_for_update:
                     return
 
                 merge_key = _get_stream_merge_key(update_obj)

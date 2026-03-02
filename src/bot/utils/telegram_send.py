@@ -6,6 +6,7 @@ from typing import Any, Optional
 
 _TELEGRAM_MESSAGE_LIMIT = 4096
 _TELEGRAM_SAFE_SPLIT_LIMIT = 3800
+_TELEGRAM_DRAFT_MESSAGE_LIMIT = 4096
 
 
 def is_private_chat_type(chat_type: Optional[str]) -> bool:
@@ -64,6 +65,18 @@ def split_text_for_telegram(
         remaining = remaining[split_at:].lstrip("\n")
 
     return chunks
+
+
+def trim_draft_text_for_telegram(
+    text: str, limit: int = _TELEGRAM_DRAFT_MESSAGE_LIMIT
+) -> str:
+    """Trim draft text to Telegram limit while preserving a truncation hint."""
+    normalized_text = str(text or "")
+    if len(normalized_text) <= limit:
+        return normalized_text
+    if limit <= 3:
+        return normalized_text[:limit]
+    return normalized_text[: limit - 3] + "..."
 
 
 def normalize_message_thread_id(
@@ -171,3 +184,64 @@ async def send_message_resilient(
         return last_message
 
     raise final_error
+
+
+async def send_message_draft_resilient(
+    bot: Any,
+    *,
+    chat_id: int,
+    draft_id: int,
+    text: str,
+    parse_mode: Optional[str] = None,
+    entities: Any = None,
+    message_thread_id: Optional[int] = None,
+    chat_type: Optional[str] = None,
+) -> bool:
+    """Send stream draft update via raw Bot API with parse fallback."""
+    private_chat = is_private_chat_type(chat_type)
+    if not private_chat:
+        return False
+
+    post_method = getattr(bot, "_post", None)
+    if not callable(post_method):
+        return False
+
+    normalized_text = str(text or "").strip()
+    if not normalized_text:
+        return False
+
+    try:
+        normalized_draft_id = abs(int(draft_id))
+    except (TypeError, ValueError):
+        return False
+    if normalized_draft_id == 0:
+        return False
+
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "draft_id": normalized_draft_id,
+        "text": trim_draft_text_for_telegram(normalized_text),
+    }
+
+    normalized_thread_id = normalize_message_thread_id(
+        message_thread_id, chat_type=chat_type
+    )
+    if normalized_thread_id is not None:
+        payload["message_thread_id"] = normalized_thread_id
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    if entities is not None:
+        payload["entities"] = entities
+
+    try:
+        await post_method("sendMessageDraft", payload)
+        return True
+    except Exception as send_error:
+        if not parse_mode or not is_markdown_parse_error(send_error):
+            raise
+
+    payload_no_md = dict(payload)
+    payload_no_md.pop("parse_mode", None)
+    payload_no_md.pop("entities", None)
+    await post_method("sendMessageDraft", payload_no_md)
+    return True
