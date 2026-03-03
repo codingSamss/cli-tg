@@ -221,6 +221,19 @@ async def test_photo_upload_codex_passes_cli_image_file_and_cleans_up(
             )
             await on_stream(
                 _FakeStreamUpdate(
+                    update_type="assistant",
+                    content="正在读取图片...",
+                    metadata={"engine": "codex"},
+                )
+            )
+            await on_stream(
+                _FakeStreamUpdate(
+                    update_type="progress",
+                    metadata={"engine": "codex", "subtype": "turn.started"},
+                )
+            )
+            await on_stream(
+                _FakeStreamUpdate(
                     update_type="system",
                     metadata={"subtype": "model_resolved", "model": "gpt-5.3-codex"},
                 )
@@ -281,7 +294,9 @@ async def test_photo_upload_codex_passes_cli_image_file_and_cleans_up(
     assert image_payload["media_type"] == "image/png"
     assert image_path.suffix == ".png"
     assert image_path.exists() is False
+    assert any("Starting Codex" in text for text in edited_texts)
     assert any("Codex is working" in text for text in edited_texts)
+    assert not any(text.count("Codex is working") > 1 for text in edited_texts)
     assert any("Session context" in text for text in edited_texts)
 
 
@@ -376,7 +391,7 @@ async def test_photo_upload_claude_stream_progress_matches_text_flow(tmp_path):
     await handle_photo(update, context)
 
     edited_texts = [call.args[0] for call in progress_msg.edit_text.await_args_list]
-    assert any("Claude is working" in text for text in edited_texts)
+    assert any("Starting Claude" in text for text in edited_texts)
     assert any("🟧 `Claude CLI`" in text for text in edited_texts)
 
 

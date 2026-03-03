@@ -1492,8 +1492,9 @@ async def _format_progress_update(update_obj: Any) -> Optional[str]:
             else update_obj.content
         )
         safe_preview = _escape_md(content_preview)
-        engine_label = _stream_engine_label(update_obj)
-        return f"🤖 *{engine_label} is working...*\n\n{safe_preview}"
+        # Keep assistant stream preview concise; engine context is already shown
+        # in the message badge/header.
+        return f"💬 {safe_preview}"
 
     elif update_obj.type == "system":
         # System initialization or other system messages
@@ -1592,6 +1593,14 @@ def _get_stream_merge_key(update_obj: Any) -> Optional[str]:
     if update_obj.type == "progress":
         return "progress"
     return None
+
+
+def _is_turn_started_update(update_obj: Any) -> bool:
+    """Whether stream update is a progress turn.started marker."""
+    if update_obj.type != "progress":
+        return False
+    metadata = getattr(update_obj, "metadata", None) or {}
+    return metadata.get("subtype") == "turn.started"
 
 
 def _is_high_priority_stream_update(update_obj: Any) -> bool:
@@ -2241,6 +2250,7 @@ async def handle_text_message(
             max(settings.stream_render_min_edit_interval_ms, 0) / 1000
         )
         last_progress_edit_ts = stream_loop.time()
+        turn_started_shown = False
 
         async def _flush_pending_progress(force: bool = False) -> None:
             nonlocal last_progress_text, last_progress_edit_ts
@@ -2345,9 +2355,13 @@ async def handle_text_message(
 
         async def stream_handler(update_obj: Any) -> None:
             nonlocal progress_msg, last_progress_text, pending_progress_text
-            nonlocal last_progress_edit_ts
+            nonlocal last_progress_edit_ts, turn_started_shown
             try:
                 await _update_stream_reaction_status(reaction_controller, update_obj)
+                if _is_turn_started_update(update_obj):
+                    if turn_started_shown:
+                        return
+                    turn_started_shown = True
                 progress_text = await _format_progress_update(update_obj)
                 if not progress_text:
                     return
@@ -3305,6 +3319,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             pending_stream_text: Optional[str] = None
             stream_flush_task: Optional[asyncio.Task] = None
             stream_flush_lock = asyncio.Lock()
+            turn_started_shown = False
             resolved_chat_type = getattr(effective_chat, "type", None)
             current_message_thread_id = getattr(
                 telegram_message, "message_thread_id", None
@@ -3459,8 +3474,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 stream_flush_task = None
 
             async def _image_stream_handler(update_obj: Any) -> None:
-                nonlocal stream_mode, pending_stream_text
+                nonlocal stream_mode, pending_stream_text, turn_started_shown
                 try:
+                    if _is_turn_started_update(update_obj):
+                        if turn_started_shown:
+                            return
+                        turn_started_shown = True
                     progress_text = await _format_progress_update(update_obj)
                     if not progress_text:
                         return

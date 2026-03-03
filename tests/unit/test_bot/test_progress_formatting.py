@@ -18,6 +18,7 @@ from src.bot.handlers.message import (
     _format_progress_update,
     _get_stream_merge_key,
     _is_high_priority_stream_update,
+    _is_turn_started_update,
     _is_markdown_parse_error,
     _is_noop_edit_error,
     _reply_text_resilient,
@@ -81,7 +82,7 @@ async def test_model_resolved_progress_text_uses_using_model_label():
 
 @pytest.mark.asyncio
 async def test_assistant_progress_text_uses_codex_label_when_metadata_present():
-    """Assistant streaming line should show Codex label for codex metadata."""
+    """Assistant streaming line should render compact content preview only."""
     update = _FakeUpdate(
         type="assistant",
         content="partial response",
@@ -91,12 +92,12 @@ async def test_assistant_progress_text_uses_codex_label_when_metadata_present():
     text = await _format_progress_update(update)
 
     assert text is not None
-    assert text.startswith("🤖 *Codex is working...*")
+    assert text == "💬 partial response"
 
 
 @pytest.mark.asyncio
 async def test_progress_turn_started_renders_codex_working_line():
-    """Codex turn.started should render a concise working status line."""
+    """Codex turn.started should render a single working line."""
     update = _FakeUpdate(
         type="progress",
         content="Codex turn started",
@@ -110,7 +111,7 @@ async def test_progress_turn_started_renders_codex_working_line():
 
 @pytest.mark.asyncio
 async def test_progress_turn_started_renders_claude_working_line():
-    """Claude turn.started should render the same style working status line."""
+    """Claude turn.started should render a single working line."""
     update = _FakeUpdate(
         type="progress",
         content="Claude turn started",
@@ -120,6 +121,17 @@ async def test_progress_turn_started_renders_claude_working_line():
     text = await _format_progress_update(update)
 
     assert text == "🤖 *Claude is working...*"
+
+
+def test_is_turn_started_update_detection():
+    """Only progress turn.started should be identified as start markers."""
+    started = _FakeUpdate(type="progress", metadata={"subtype": "turn.started"})
+    progress = _FakeUpdate(type="progress", metadata={"subtype": "step"})
+    assistant = _FakeUpdate(type="assistant", metadata={"subtype": "turn.started"})
+
+    assert _is_turn_started_update(started) is True
+    assert _is_turn_started_update(progress) is False
+    assert _is_turn_started_update(assistant) is False
 
 
 @pytest.mark.asyncio
