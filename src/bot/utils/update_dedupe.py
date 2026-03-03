@@ -41,3 +41,7 @@ class UpdateDedupeCache:
     def _evict_overflow(self) -> None:
         while len(self._seen_updates) > self.max_size:
             self._seen_updates.popitem(last=False)
+
+    def clear(self) -> None:
+        """Clear all cached update ids."""
+        self._seen_updates.clear()

@@ -42,6 +42,7 @@ logger = structlog.get_logger()
 
 _POLLING_WATCHDOG_INTERVAL_SECONDS = 2.0
 _POLLING_RECOVERY_ERROR_THRESHOLD = 3
+_DUPLICATE_UPDATE_RECOVERY_THRESHOLD = 3
 _POLLING_RESTART_COOLDOWN_SECONDS = 8.0
 
 
@@ -65,6 +66,8 @@ class ClaudeCodeBot:
         self._update_dedupe_cache = UpdateDedupeCache(ttl_seconds=300, max_size=5000)
         self._update_offset_store: Optional[UpdateOffsetStore] = None
         self._startup_min_update_id: Optional[int] = None
+        self._duplicate_update_id: Optional[int] = None
+        self._duplicate_update_repeat_count: int = 0
 
     def _require_app(self) -> Application:
         """Return initialized Telegram application or raise."""
@@ -294,8 +297,33 @@ class ClaudeCodeBot:
             raise ApplicationHandlerStop
 
         if self._update_dedupe_cache.check_and_mark(update_id):
-            logger.debug("Skipping duplicate Telegram update", update_id=update_id)
+            if self._duplicate_update_id == update_id:
+                self._duplicate_update_repeat_count += 1
+            else:
+                self._duplicate_update_id = update_id
+                self._duplicate_update_repeat_count = 1
+
+            if (
+                self._duplicate_update_repeat_count
+                >= _DUPLICATE_UPDATE_RECOVERY_THRESHOLD
+                and not self._polling_restart_requested
+            ):
+                self._polling_restart_requested = True
+                logger.warning(
+                    "Duplicate update self-recovery flagged",
+                    update_id=update_id,
+                    repeat_count=self._duplicate_update_repeat_count,
+                    threshold=_DUPLICATE_UPDATE_RECOVERY_THRESHOLD,
+                )
+
+            logger.debug(
+                "Skipping duplicate Telegram update",
+                update_id=update_id,
+                repeat_count=self._duplicate_update_repeat_count,
+            )
             raise ApplicationHandlerStop
+
+        self._reset_duplicate_update_recovery_state()
 
         if self._update_offset_store is not None:
             try:
@@ -468,6 +496,12 @@ class ClaudeCodeBot:
         self._polling_error_window_start = 0.0
         self._last_polling_error_log = 0.0
         self._polling_restart_requested = False
+        self._reset_duplicate_update_recovery_state()
+
+    def _reset_duplicate_update_recovery_state(self) -> None:
+        """Reset duplicate-update recovery trackers."""
+        self._duplicate_update_id = None
+        self._duplicate_update_repeat_count = 0
 
     async def _start_polling(self, *, drop_pending_updates: bool) -> None:
         """Start Telegram polling with shared options."""
@@ -511,6 +545,12 @@ class ClaudeCodeBot:
         try:
             if updater.running:
                 await updater.stop()
+
+            # Clear in-memory dedupe state so a previously stuck update can be retried
+            # after the polling transport is restarted.
+            self._update_dedupe_cache.clear()
+            self._reset_duplicate_update_recovery_state()
+
             # Keep pending Telegram updates during self-heal restart so
             # transient network issues do not drop user messages.
             await self._start_polling(drop_pending_updates=False)

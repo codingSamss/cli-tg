@@ -2,7 +2,7 @@
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -35,6 +35,9 @@ async def test_restart_polling_stops_then_starts_updater() -> None:
     bot.app = SimpleNamespace(updater=updater)
     bot._polling_restart_requested = True
     bot._polling_error_count = 9
+    bot._duplicate_update_id = 123
+    bot._duplicate_update_repeat_count = 4
+    bot._update_dedupe_cache = SimpleNamespace(clear=Mock())
 
     restarted = await bot._restart_polling(reason="unit_test")
 
@@ -47,6 +50,9 @@ async def test_restart_polling_stops_then_starts_updater() -> None:
     assert kwargs["error_callback"] == bot._polling_error_callback
     assert bot._polling_restart_requested is False
     assert bot._polling_error_count == 0
+    bot._update_dedupe_cache.clear.assert_called_once()
+    assert bot._duplicate_update_id is None
+    assert bot._duplicate_update_repeat_count == 0
 
 
 @pytest.mark.asyncio
