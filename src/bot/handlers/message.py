@@ -726,6 +726,45 @@ async def _reply_text_resilient(
     raise final_error
 
 
+async def _send_private_final_response_draft(
+    *,
+    bot: Any,
+    chat_id: Optional[int],
+    chat_type: Optional[str],
+    message_thread_id: Optional[int],
+    draft_id: int,
+    text: str,
+    parse_mode: Optional[str] = None,
+) -> bool:
+    """Send a private-chat final-response draft preview when available."""
+    if not isinstance(chat_id, int):
+        return False
+    if not is_private_chat_type(chat_type):
+        return False
+
+    normalized_text = str(text or "").strip()
+    if not normalized_text:
+        return False
+
+    try:
+        return await send_message_draft_resilient(
+            bot=bot,
+            chat_id=chat_id,
+            draft_id=draft_id,
+            text=normalized_text,
+            parse_mode=parse_mode,
+            message_thread_id=message_thread_id,
+            chat_type=chat_type,
+        )
+    except Exception as error:
+        logger.info(
+            "sendMessageDraft unavailable for final response, fallback to reply_text",
+            chat_id=chat_id,
+            error=str(error),
+        )
+        return False
+
+
 async def _set_message_reaction_safe(
     bot: Any,
     *,
@@ -2182,9 +2221,6 @@ async def handle_text_message(
         force_new_session = scope_state.get("force_new_session", False)
         resolved_chat_type = getattr(effective_chat, "type", None)
         current_message_thread_id = getattr(telegram_message, "message_thread_id", None)
-        draft_stream_enabled = is_private_chat_type(resolved_chat_type)
-        draft_stream_failed = False
-        last_draft_stream_text = ""
         draft_seed = input_message_id if isinstance(input_message_id, int) else 0
         if draft_seed <= 0:
             draft_seed = int(time.time() * 1000) % 2147483647
@@ -2310,43 +2346,10 @@ async def handle_text_message(
         async def stream_handler(update_obj: Any) -> None:
             nonlocal progress_msg, last_progress_text, pending_progress_text
             nonlocal last_progress_edit_ts
-            nonlocal draft_stream_failed, last_draft_stream_text
             try:
                 await _update_stream_reaction_status(reaction_controller, update_obj)
-                sent_draft_for_update = False
-                if (
-                    draft_stream_enabled
-                    and not draft_stream_failed
-                    and update_obj.type == "assistant"
-                    and update_obj.content
-                    and not update_obj.tool_calls
-                ):
-                    draft_text = str(update_obj.content or "").strip()
-                    if draft_text and draft_text != last_draft_stream_text:
-                        try:
-                            sent_draft_for_update = await send_message_draft_resilient(
-                                bot=context.bot,
-                                chat_id=input_chat_id,
-                                draft_id=draft_id,
-                                text=draft_text,
-                                message_thread_id=current_message_thread_id,
-                                chat_type=resolved_chat_type,
-                            )
-                            if sent_draft_for_update:
-                                last_draft_stream_text = draft_text
-                        except Exception as draft_error:
-                            draft_stream_failed = True
-                            logger.info(
-                                "sendMessageDraft unavailable, fallback to edit_text",
-                                user_id=user_id,
-                                chat_id=input_chat_id,
-                                error=str(draft_error),
-                            )
-
                 progress_text = await _format_progress_update(update_obj)
                 if not progress_text:
-                    return
-                if sent_draft_for_update:
                     return
 
                 merge_key = _get_stream_merge_key(update_obj)
@@ -2710,6 +2713,7 @@ async def handle_text_message(
                 await reaction_controller.set_error()
 
         # Send formatted responses (may be multiple messages)
+        final_draft_sent = False
         for i, message in enumerate(formatted_messages):
             try:
                 msg_text = message.text
@@ -2729,6 +2733,17 @@ async def handle_text_message(
                             chat_type=getattr(effective_chat, "type", None),
                         )
                         reply_to_id = None
+
+                if i == 0 and not final_draft_sent:
+                    final_draft_sent = await _send_private_final_response_draft(
+                        bot=context.bot,
+                        chat_id=input_chat_id,
+                        chat_type=resolved_chat_type,
+                        message_thread_id=current_message_thread_id,
+                        draft_id=draft_id,
+                        text=msg_text,
+                        parse_mode=message.parse_mode,
+                    )
 
                 await _reply_text_resilient(
                     telegram_message,
@@ -3290,6 +3305,19 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             pending_stream_text: Optional[str] = None
             stream_flush_task: Optional[asyncio.Task] = None
             stream_flush_lock = asyncio.Lock()
+            resolved_chat_type = getattr(effective_chat, "type", None)
+            current_message_thread_id = getattr(
+                telegram_message, "message_thread_id", None
+            )
+            draft_seed = (
+                reply_target_message_id
+                if isinstance(reply_target_message_id, int)
+                and reply_target_message_id > 0
+                else int(getattr(telegram_message, "message_id", 0) or 0)
+            )
+            if draft_seed <= 0:
+                draft_seed = int(time.time() * 1000) % 2147483647
+            draft_id = draft_seed or 1
             stream_loop = asyncio.get_event_loop()
             debounce_ms = int(getattr(settings, "stream_render_debounce_ms", 1000) or 0)
             min_edit_interval_ms = int(
@@ -3823,6 +3851,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                         pass
 
                 # Send responses
+                final_draft_sent = False
                 for i, message in enumerate(formatted_messages):
                     msg_text = message.text
                     reply_to_id = reply_target_message_id if i == 0 else None
@@ -3843,6 +3872,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                                 chat_type=getattr(effective_chat, "type", None),
                             )
                             reply_to_id = None
+
+                    if i == 0 and not final_draft_sent:
+                        final_draft_sent = await _send_private_final_response_draft(
+                            bot=context.bot,
+                            chat_id=chat_id,
+                            chat_type=resolved_chat_type,
+                            message_thread_id=current_message_thread_id,
+                            draft_id=draft_id,
+                            text=msg_text,
+                            parse_mode=message.parse_mode,
+                        )
 
                     await _reply_text_resilient(
                         telegram_message,

@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import AsyncMock
 
@@ -21,6 +22,7 @@ from src.bot.handlers.message import (
     _is_noop_edit_error,
     _reply_text_resilient,
     _resolve_collapsed_fallback_model,
+    _send_private_final_response_draft,
     _split_text_for_telegram,
     _with_engine_badge,
 )
@@ -277,6 +279,38 @@ def test_noop_edit_error_detection():
         _is_noop_edit_error(Exception("Bad Request: message is not modified")) is True
     )
     assert _is_noop_edit_error(Exception("network timeout")) is False
+
+
+@pytest.mark.asyncio
+async def test_send_private_final_response_draft_only_for_private_chat(monkeypatch):
+    """Final-response draft preview should be private-chat only."""
+    sender = AsyncMock(return_value=True)
+    monkeypatch.setattr("src.bot.handlers.message.send_message_draft_resilient", sender)
+
+    sent_private = await _send_private_final_response_draft(
+        bot=SimpleNamespace(),
+        chat_id=12345,
+        chat_type="private",
+        message_thread_id=None,
+        draft_id=777,
+        text="最终结论",
+        parse_mode="Markdown",
+    )
+    sent_group = await _send_private_final_response_draft(
+        bot=SimpleNamespace(),
+        chat_id=-1001,
+        chat_type="supergroup",
+        message_thread_id=None,
+        draft_id=888,
+        text="群聊结论",
+        parse_mode="Markdown",
+    )
+
+    assert sent_private is True
+    assert sent_group is False
+    assert sender.await_count == 1
+    assert sender.await_args.kwargs["chat_id"] == 12345
+    assert sender.await_args.kwargs["draft_id"] == 777
 
 
 def test_markdown_parse_error_detection():

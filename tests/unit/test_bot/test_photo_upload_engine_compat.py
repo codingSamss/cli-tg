@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from src.bot.handlers import message as message_handler
 from src.bot.handlers.message import _integration_supports_image_analysis, handle_photo
 from src.bot.utils.cli_engine import ENGINE_STATE_KEY
 from src.config.settings import Settings
@@ -377,3 +378,92 @@ async def test_photo_upload_claude_stream_progress_matches_text_flow(tmp_path):
     edited_texts = [call.args[0] for call in progress_msg.edit_text.await_args_list]
     assert any("Claude is working" in text for text in edited_texts)
     assert any("🟧 `Claude CLI`" in text for text in edited_texts)
+
+
+@pytest.mark.asyncio
+async def test_photo_upload_private_chat_drafts_only_final_response(tmp_path, monkeypatch):
+    """Private image flow should use draft only for final response delivery."""
+    approved = tmp_path / "approved"
+    approved.mkdir()
+    user_id = 3302
+
+    settings = Settings(
+        telegram_bot_token="test:token",
+        telegram_bot_username="testbot",
+        approved_directory=approved,
+        use_sdk=True,
+    )
+
+    progress_msg = SimpleNamespace(
+        edit_text=AsyncMock(),
+        delete=AsyncMock(),
+        message_id=9301,
+    )
+    message = SimpleNamespace(
+        reply_text=AsyncMock(return_value=progress_msg),
+        message_id=1002,
+        caption="请分析截图",
+        photo=[SimpleNamespace()],
+        message_thread_id=None,
+    )
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=user_id),
+        effective_chat=SimpleNamespace(id=user_id, type="private"),
+        effective_message=SimpleNamespace(message_thread_id=None),
+        message=message,
+    )
+
+    image_bytes = b"\xff\xd8\xff" + b"\x00" * 256
+    processed_image = SimpleNamespace(
+        prompt="请分析截图",
+        base64_data=base64.b64encode(image_bytes).decode("utf-8"),
+        metadata={"format": "jpeg"},
+    )
+    image_handler = SimpleNamespace(
+        process_image=AsyncMock(return_value=processed_image)
+    )
+
+    async def _run_command_side_effect(**kwargs):
+        on_stream = kwargs.get("on_stream")
+        if on_stream:
+            await on_stream(
+                _FakeStreamUpdate(
+                    update_type="assistant",
+                    content="中间进度",
+                    metadata={"engine": "codex"},
+                )
+            )
+        return SimpleNamespace(session_id="codex-session-2", content="最终结论")
+
+    codex_integration = SimpleNamespace(
+        config=SimpleNamespace(use_sdk=True),
+        sdk_manager=object(),
+        run_command=AsyncMock(side_effect=_run_command_side_effect),
+    )
+
+    draft_sender = AsyncMock(return_value=True)
+    monkeypatch.setattr(message_handler, "send_message_draft_resilient", draft_sender)
+
+    context = SimpleNamespace(
+        bot=SimpleNamespace(),
+        bot_data={
+            "settings": settings,
+            "features": _FakeFeatures(image_handler=image_handler),
+            "cli_integrations": {"codex": codex_integration},
+        },
+        user_data={
+            "scope_state": {
+                _scope_key(user_id): {
+                    ENGINE_STATE_KEY: "codex",
+                    "current_directory": approved,
+                }
+            }
+        },
+    )
+
+    await handle_photo(update, context)
+
+    assert draft_sender.await_count == 1
+    assert draft_sender.await_args.kwargs["chat_id"] == user_id
+    assert draft_sender.await_args.kwargs["chat_type"] == "private"
+    assert "最终结论" in draft_sender.await_args.kwargs["text"]
