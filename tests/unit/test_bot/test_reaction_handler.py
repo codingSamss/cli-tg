@@ -8,8 +8,8 @@ from unittest.mock import AsyncMock
 import pytest
 
 from src.bot.handlers.message import (
-    _MessageStatusReactionController,
     _compose_prompt_with_reaction_feedback,
+    _MessageStatusReactionController,
     _resolve_status_reaction_tool_emoji,
     _set_message_reaction_safe,
     handle_message_reaction,
@@ -266,7 +266,9 @@ async def test_status_reaction_controller_progression():
     await controller.set_done()
     await controller.shutdown()
 
-    reactions = [call.kwargs["reaction"] for call in bot.set_message_reaction.await_args_list]
+    reactions = [
+        call.kwargs["reaction"] for call in bot.set_message_reaction.await_args_list
+    ]
     assert reactions[0] == ["👀"]
     assert ["⚡"] in reactions
     assert reactions[-1] == ["👍"]
@@ -292,7 +294,9 @@ async def test_status_reaction_controller_emits_stall_reactions():
     await controller.set_done()
     await controller.shutdown()
 
-    reactions = [call.kwargs["reaction"] for call in bot.set_message_reaction.await_args_list]
+    reactions = [
+        call.kwargs["reaction"] for call in bot.set_message_reaction.await_args_list
+    ]
     assert ["🥱"] in reactions
     assert ["😨"] in reactions
 

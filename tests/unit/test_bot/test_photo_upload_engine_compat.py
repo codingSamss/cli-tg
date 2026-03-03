@@ -396,7 +396,9 @@ async def test_photo_upload_claude_stream_progress_matches_text_flow(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_photo_upload_private_chat_drafts_only_final_response(tmp_path, monkeypatch):
+async def test_photo_upload_private_chat_drafts_only_final_response(
+    tmp_path, monkeypatch
+):
     """Private image flow should use draft only for final response delivery."""
     approved = tmp_path / "approved"
     approved.mkdir()
