@@ -32,6 +32,7 @@ from ..exceptions import ClaudeCodeTelegramError
 from ..security.validators import SecurityValidator
 from ..storage.facade import Storage
 from .features.registry import FeatureRegistry
+from .inbound_task_queue import InboundTaskQueue
 from .utils.cli_engine import ENGINE_CLAUDE
 from .utils.command_menu import build_bot_commands_for_engine
 from .utils.telegram_send import send_message_resilient
@@ -117,6 +118,7 @@ class ClaudeCodeBot:
 
         # Initialize task registry for cancel support
         self.deps["task_registry"] = TaskRegistry()
+        self.deps["inbound_task_queue"] = InboundTaskQueue()
         self._initialize_update_tracking()
 
         # Set bot commands for menu
@@ -178,6 +180,8 @@ class ClaudeCodeBot:
             ("export", command.export_session),
             ("git", command.git_command),
             ("cancel", command.cancel_task),
+            ("queue", command.queue_status_command),
+            ("dequeue", command.dequeue_command),
             ("resume", command.resume_command),
             ("model", command.model_command),
             ("codexdiag", command.codex_diag_command),

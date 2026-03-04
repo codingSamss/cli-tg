@@ -33,6 +33,31 @@ async def test_thinking_expand_uses_cached_lines_and_collapse_button() -> None:
 
 
 @pytest.mark.asyncio
+async def test_thinking_expand_adds_spacing_around_command_blocks() -> None:
+    """Expand view should keep command blocks visually separated."""
+    query = SimpleNamespace(edit_message_text=AsyncMock())
+    context = SimpleNamespace(
+        user_data={
+            "thinking:124": {
+                "lines": [
+                    "🤔 pre-check",
+                    "🔧 *Running command*\n\n`/bin/zsh -lc 'make lint'`",
+                    "❌ *Command failed* \\(exit 2\\)\n\n`/bin/zsh -lc 'make lint'`",
+                ],
+                "summary": "Thinking done -- 1 errors",
+            }
+        }
+    )
+
+    await handle_thinking_callback(query, "expand:124", context)
+
+    call = query.edit_message_text.await_args
+    rendered = call.args[0]
+    assert "🤔 pre-check\n\n🔧 *Running command*" in rendered
+    assert "`/bin/zsh -lc 'make lint'`\n\n❌ *Command failed*" in rendered
+
+
+@pytest.mark.asyncio
 async def test_thinking_expand_truncates_when_content_is_too_long() -> None:
     """Expand action should truncate long thinking content safely."""
     query = SimpleNamespace(edit_message_text=AsyncMock())

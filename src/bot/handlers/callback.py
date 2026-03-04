@@ -21,6 +21,7 @@ from ...services.session_interaction_service import SessionInteractionService
 from ...services.session_lifecycle_service import SessionLifecycleService
 from ...services.session_service import SessionService
 from ..features.session_export import ExportFormat
+from ..inbound_task_queue import InboundTaskQueue
 from ..utils.cli_engine import (
     ENGINE_CLAUDE,
     ENGINE_CODEX,
@@ -39,10 +40,15 @@ from ..utils.scope_state import get_scope_state_from_query
 from ..utils.telegram_send import (
     is_markdown_parse_error,
     normalize_message_thread_id,
+    prepare_telegram_text_and_parse_mode,
     send_message_resilient,
 )
 from ..utils.ui_adapter import build_reply_markup_from_spec
-from .message import _resolve_model_override, build_permission_handler
+from .message import (
+    _join_progress_lines_for_display,
+    _resolve_model_override,
+    build_permission_handler,
+)
 
 logger = structlog.get_logger()
 _PARSE_MODE_UNSET = object()
@@ -59,6 +65,11 @@ async def _reply_query_message_resilient(
     reply_to_message_id: int | None = None,
 ) -> Any:
     """Reply to callback message with fallback to resilient send helper."""
+    original_text = str(text or "")
+    prepared_text, prepared_parse_mode, _ = prepare_telegram_text_and_parse_mode(
+        original_text, parse_mode
+    )
+
     message = getattr(query, "message", None)
     if message is None:
         return None
@@ -67,8 +78,8 @@ async def _reply_query_message_resilient(
     chat_obj = getattr(message, "chat", None)
     chat_type = getattr(chat_obj, "type", None)
     should_quote_reply = str(chat_type or "").strip().lower() != "private"
-    if parse_mode is not None:
-        send_kwargs["parse_mode"] = parse_mode
+    if prepared_parse_mode is not None:
+        send_kwargs["parse_mode"] = prepared_parse_mode
     if reply_markup is not None:
         send_kwargs["reply_markup"] = reply_markup
     if (
@@ -79,7 +90,7 @@ async def _reply_query_message_resilient(
         send_kwargs["reply_to_message_id"] = reply_to_message_id
 
     try:
-        return await message.reply_text(text, **send_kwargs)
+        return await message.reply_text(prepared_text, **send_kwargs)
     except Exception:
         bot = getattr(context, "bot", None)
         chat_id = getattr(message, "chat_id", None)
@@ -91,7 +102,7 @@ async def _reply_query_message_resilient(
         return await send_message_resilient(
             bot=bot,
             chat_id=chat_id,
-            text=text,
+            text=original_text,
             parse_mode=parse_mode,
             reply_markup=reply_markup,
             reply_to_message_id=reply_to_message_id,
@@ -113,24 +124,52 @@ async def _edit_query_message_resilient(
     reply_markup: InlineKeyboardMarkup | None = None,
 ) -> Any:
     """Edit callback message with markdown/no-op fallback."""
+    original_text = str(text or "")
+    prepared_text = original_text
+    prepared_parse_mode: str | None | object = parse_mode
+    html_upgraded_from_markdown = False
+    if parse_mode is not _PARSE_MODE_UNSET:
+        requested_parse_mode: str | None = (
+            parse_mode if isinstance(parse_mode, str) else None
+        )
+        (
+            prepared_text,
+            prepared_parse_mode,
+            html_upgraded_from_markdown,
+        ) = prepare_telegram_text_and_parse_mode(original_text, requested_parse_mode)
+
     edit_kwargs: dict[str, Any] = {}
     if parse_mode is not _PARSE_MODE_UNSET:
-        edit_kwargs["parse_mode"] = parse_mode
+        edit_kwargs["parse_mode"] = prepared_parse_mode
     if reply_markup is not None:
         edit_kwargs["reply_markup"] = reply_markup
 
     try:
-        return await query.edit_message_text(text, **edit_kwargs)
+        return await query.edit_message_text(prepared_text, **edit_kwargs)
     except Exception as edit_error:
         if _is_noop_edit_error(edit_error):
             return None
         if parse_mode not in (None, _PARSE_MODE_UNSET) and is_markdown_parse_error(
             edit_error
         ):
+            if (
+                html_upgraded_from_markdown
+                and str(parse_mode or "").strip().lower() == "markdown"
+            ):
+                markdown_kwargs = dict(edit_kwargs)
+                markdown_kwargs["parse_mode"] = "Markdown"
+                try:
+                    return await query.edit_message_text(
+                        original_text, **markdown_kwargs
+                    )
+                except Exception as markdown_error:
+                    if _is_noop_edit_error(markdown_error):
+                        return None
+
             fallback_kwargs = dict(edit_kwargs)
             fallback_kwargs.pop("parse_mode", None)
             try:
-                return await query.edit_message_text(text, **fallback_kwargs)
+                return await query.edit_message_text(original_text, **fallback_kwargs)
             except Exception as fallback_error:
                 if _is_noop_edit_error(fallback_error):
                     return None
@@ -650,6 +689,7 @@ async def handle_callback_query(
             "model": handle_model_callback,
             "engine": handle_engine_callback,
             "provider": handle_provider_callback,
+            "queue": handle_queue_callback,
         }
 
         handler = handlers.get(action)
@@ -796,6 +836,95 @@ async def handle_cd_callback(
             await audit_logger.log_command(
                 user_id=user_id, command="cd", args=[project_name], success=False
             )
+
+
+async def handle_queue_callback(
+    query: Any, param: str, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handle queue callback actions such as removing a queued task."""
+    user_id = query.from_user.id
+    inbound_queue: Optional[InboundTaskQueue] = context.bot_data.get(
+        "inbound_task_queue"
+    )
+    if not inbound_queue:
+        await _edit_query_message_resilient(query, "❌ Queue service unavailable.")
+        return
+
+    if not param.startswith("dequeue:"):
+        await _edit_query_message_resilient(query, "❌ Invalid queue action.")
+        return
+
+    raw_queue_id = param.split(":", 1)[1].strip()
+    if not raw_queue_id.isdigit():
+        await _edit_query_message_resilient(query, "❌ Invalid queue id.")
+        return
+    queue_id = int(raw_queue_id)
+    if queue_id <= 0:
+        await _edit_query_message_resilient(query, "❌ Invalid queue id.")
+        return
+
+    scope_key, _ = _get_scope_state_for_query(query, context)
+    removed = await inbound_queue.remove(
+        user_id=user_id,
+        scope_key=scope_key or f"user:{user_id}",
+        queue_id=queue_id,
+    )
+
+    if removed:
+        message_obj = getattr(query, "message", None)
+        chat_obj = getattr(message_obj, "chat", None)
+        chat_id = getattr(chat_obj, "id", None)
+        callback_message_id = getattr(message_obj, "message_id", None)
+        source_message_id = getattr(removed, "source_message_id", None)
+        target_message_ids: list[int] = []
+        for candidate in (source_message_id, callback_message_id):
+            if (
+                isinstance(candidate, int)
+                and candidate > 0
+                and candidate not in target_message_ids
+            ):
+                target_message_ids.append(candidate)
+
+        deleted_message_ids: set[int] = set()
+        delete_message = getattr(getattr(context, "bot", None), "delete_message", None)
+        if callable(delete_message) and isinstance(chat_id, int):
+            for message_id in target_message_ids:
+                try:
+                    await delete_message(chat_id=chat_id, message_id=message_id)
+                    deleted_message_ids.add(message_id)
+                except Exception as delete_error:
+                    logger.info(
+                        "Failed to delete queue-related message after dequeue",
+                        user_id=user_id,
+                        queue_id=queue_id,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        error=str(delete_error),
+                    )
+
+        callback_deleted = (
+            isinstance(callback_message_id, int)
+            and callback_message_id in deleted_message_ids
+        )
+        if not callback_deleted:
+            await _edit_query_message_resilient(
+                query,
+                f"✅ Removed queue item #{queue_id}.",
+            )
+    else:
+        await _edit_query_message_resilient(
+            query,
+            f"⚠️ Queue item #{queue_id} not found.",
+        )
+
+    audit_logger: Optional[AuditLogger] = context.bot_data.get("audit_logger")
+    if audit_logger:
+        await audit_logger.log_command(
+            user_id=user_id,
+            command="queue_button_dequeue",
+            args=[str(queue_id)],
+            success=removed is not None,
+        )
 
 
 async def handle_action_callback(
@@ -2327,7 +2456,7 @@ async def handle_thinking_callback(
                 return False
 
     if action == "expand":
-        full_text = "\n".join(cached["lines"])
+        full_text = _join_progress_lines_for_display(cached["lines"])
 
         # Truncate if exceeds Telegram limit
         if len(full_text) > 3800:
@@ -2392,16 +2521,16 @@ def _truncate_thinking(lines: list[str], max_chars: int = 3800) -> str:
     result: list[str] = []
     total = 0
     for line in reversed(lines):
-        if total + len(line) + 1 > max_chars - 50:
+        if total + len(line) + 2 > max_chars - 50:
             break
         result.insert(0, line)
-        total += len(line) + 1
+        total += len(line) + 2
 
     skipped = len(lines) - len(result)
     if skipped > 0:
         result.insert(0, f"... ({skipped} earlier entries omitted)")
 
-    return "\n".join(result)
+    return _join_progress_lines_for_display(result)
 
 
 def _format_file_size(size: int) -> str:

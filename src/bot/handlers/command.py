@@ -16,6 +16,7 @@ from ...security.validators import SecurityValidator
 from ...services.session_interaction_service import SessionInteractionService
 from ...services.session_lifecycle_service import SessionLifecycleService
 from ...services.session_service import SessionService
+from ..inbound_task_queue import InboundTaskQueue
 from ..utils.cli_engine import (
     ENGINE_CLAUDE,
     ENGINE_CODEX,
@@ -34,6 +35,7 @@ from ..utils.scope_state import get_scope_state_from_update
 from ..utils.telegram_send import (
     is_markdown_parse_error,
     normalize_message_thread_id,
+    prepare_telegram_text_and_parse_mode,
     send_message_resilient,
 )
 from ..utils.ui_adapter import build_reply_markup_from_spec
@@ -70,6 +72,11 @@ async def _reply_update_message_resilient(
     reply_to_message_id: int | None = None,
 ) -> Any:
     """Reply to update message with fallback to resilient send helper."""
+    original_text = str(text or "")
+    prepared_text, prepared_parse_mode, _ = prepare_telegram_text_and_parse_mode(
+        original_text, parse_mode
+    )
+
     message = getattr(update, "message", None)
     if message is None:
         return None
@@ -77,8 +84,8 @@ async def _reply_update_message_resilient(
     send_kwargs: dict[str, Any] = {}
     chat_type = getattr(update.effective_chat, "type", None)
     should_quote_reply = str(chat_type or "").strip().lower() != "private"
-    if parse_mode is not None:
-        send_kwargs["parse_mode"] = parse_mode
+    if prepared_parse_mode is not None:
+        send_kwargs["parse_mode"] = prepared_parse_mode
     if reply_markup is not None:
         send_kwargs["reply_markup"] = reply_markup
     if (
@@ -89,7 +96,7 @@ async def _reply_update_message_resilient(
         send_kwargs["reply_to_message_id"] = reply_to_message_id
 
     try:
-        return await message.reply_text(text, **send_kwargs)
+        return await message.reply_text(prepared_text, **send_kwargs)
     except Exception:
         bot = getattr(context, "bot", None)
         chat = getattr(update, "effective_chat", None)
@@ -100,7 +107,7 @@ async def _reply_update_message_resilient(
         return await send_message_resilient(
             bot=bot,
             chat_id=chat_id,
-            text=text,
+            text=original_text,
             parse_mode=parse_mode,
             reply_markup=reply_markup,
             reply_to_message_id=reply_to_message_id,
@@ -109,6 +116,47 @@ async def _reply_update_message_resilient(
             ),
             chat_type=chat_type,
         )
+
+
+async def _set_update_message_reaction_safe(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    emoji: str,
+) -> bool:
+    """Best-effort command feedback via reaction to avoid extra chat bubbles."""
+    bot = getattr(context, "bot", None)
+    message = getattr(update, "message", None)
+    chat = getattr(update, "effective_chat", None)
+    chat_id = getattr(chat, "id", None)
+    message_id = getattr(message, "message_id", None)
+    if (
+        bot is None
+        or not hasattr(bot, "set_message_reaction")
+        or not isinstance(chat_id, int)
+        or not isinstance(message_id, int)
+    ):
+        return False
+
+    normalized_emoji = str(emoji or "").strip()
+    reaction_payload: list[str] = [normalized_emoji] if normalized_emoji else []
+    try:
+        await bot.set_message_reaction(
+            chat_id=chat_id,
+            message_id=message_id,
+            reaction=reaction_payload,
+            is_big=False,
+        )
+        return True
+    except Exception as error:
+        logger.debug(
+            "Failed to set command reaction feedback",
+            chat_id=chat_id,
+            message_id=message_id,
+            emoji=normalized_emoji or None,
+            error=str(error),
+        )
+        return False
 
 
 def _is_noop_edit_error(error: Exception) -> bool:
@@ -124,24 +172,50 @@ async def _edit_message_resilient(
     reply_markup: InlineKeyboardMarkup | None = None,
 ) -> Any:
     """Edit message with markdown/no-op fallback."""
+    original_text = str(text or "")
+    prepared_text = original_text
+    prepared_parse_mode: str | None | object = parse_mode
+    html_upgraded_from_markdown = False
+    if parse_mode is not _PARSE_MODE_UNSET:
+        requested_parse_mode: str | None = (
+            parse_mode if isinstance(parse_mode, str) else None
+        )
+        (
+            prepared_text,
+            prepared_parse_mode,
+            html_upgraded_from_markdown,
+        ) = prepare_telegram_text_and_parse_mode(original_text, requested_parse_mode)
+
     edit_kwargs: dict[str, Any] = {}
     if parse_mode is not _PARSE_MODE_UNSET:
-        edit_kwargs["parse_mode"] = parse_mode
+        edit_kwargs["parse_mode"] = prepared_parse_mode
     if reply_markup is not None:
         edit_kwargs["reply_markup"] = reply_markup
 
     try:
-        return await message.edit_text(text, **edit_kwargs)
+        return await message.edit_text(prepared_text, **edit_kwargs)
     except Exception as edit_error:
         if _is_noop_edit_error(edit_error):
             return None
         if parse_mode not in (None, _PARSE_MODE_UNSET) and is_markdown_parse_error(
             edit_error
         ):
+            if (
+                html_upgraded_from_markdown
+                and str(parse_mode or "").strip().lower() == "markdown"
+            ):
+                markdown_kwargs = dict(edit_kwargs)
+                markdown_kwargs["parse_mode"] = "Markdown"
+                try:
+                    return await message.edit_text(original_text, **markdown_kwargs)
+                except Exception as markdown_error:
+                    if _is_noop_edit_error(markdown_error):
+                        return None
+
             fallback_kwargs = dict(edit_kwargs)
             fallback_kwargs.pop("parse_mode", None)
             try:
-                return await message.edit_text(text, **fallback_kwargs)
+                return await message.edit_text(original_text, **fallback_kwargs)
             except Exception as fallback_error:
                 if _is_noop_edit_error(fallback_error):
                     return None
@@ -426,6 +500,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"• `/projects` - Show available projects\n"
         f"{status_line}\n"
         f"• `/engine [claude|codex]` - Switch CLI engine\n"
+        f"• `/cancel` - Cancel current running task\n"
+        f"• `/queue` - Show queued tasks\n"
+        f"• `/dequeue <id>` - Remove one queued task\n"
         f"• `/git` - Git repository commands\n"
         f"{diagnostics_line}\n"
         f"**Quick Start:**\n"
@@ -512,6 +589,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"{status_alias_line}\n"
         "• `/engine [claude|codex]` - Switch active CLI engine\n"
         "• `/provider` - Switch API provider (cc-switch)\n"
+        "• `/cancel` - Cancel current running task\n"
+        "• `/queue` - Show queued tasks\n"
+        "• `/dequeue <id>` - Remove one queued task\n"
         f"{model_line}"
         "• `/export` - Export session history\n"
         "• `/git` - Git repository information\n\n"
@@ -1767,6 +1847,126 @@ async def cancel_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if audit_logger:
         await audit_logger.log_command(
             user_id=user_id, command="cancel", args=[], success=cancelled
+        )
+
+
+def _parse_queue_id(raw_arg: str) -> Optional[int]:
+    """Parse queue id token like `12` or `#12`."""
+    candidate = str(raw_arg or "").strip()
+    if candidate.startswith("#"):
+        candidate = candidate[1:]
+    if not candidate.isdigit():
+        return None
+    parsed = int(candidate)
+    if parsed <= 0:
+        return None
+    return parsed
+
+
+async def queue_status_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handle /queue command - show current running + queued tasks in scope."""
+    user_id = _require_effective_user(update).id
+    settings: Settings = context.bot_data["settings"]
+    scope_key, _ = get_scope_state_from_update(
+        user_data=context.user_data,
+        update=update,
+        default_directory=settings.approved_directory,
+    )
+
+    inbound_queue: Optional[InboundTaskQueue] = context.bot_data.get(
+        "inbound_task_queue"
+    )
+    if not inbound_queue:
+        await _reply_update_message_resilient(
+            update, context, "Queue service unavailable."
+        )
+        return
+
+    pending_items = await inbound_queue.list_items(user_id=user_id, scope_key=scope_key)
+    task_registry: Optional[TaskRegistry] = context.bot_data.get("task_registry")
+    running = (
+        await task_registry.get(user_id, scope_key=scope_key) if task_registry else None
+    )
+    lines = ["Queue status"]
+    if running:
+        running_summary = running.prompt_summary or "(no summary)"
+        lines.append(f"Running: yes - {running_summary}")
+    else:
+        lines.append("Running: no")
+
+    if not pending_items:
+        lines.append("Pending: empty")
+    else:
+        lines.append(f"Pending: {len(pending_items)}")
+        for item in pending_items:
+            lines.append(f"#{item.queue_id} [{item.kind}] {item.preview}")
+        lines.append("Use /dequeue <id> to remove one queued task.")
+
+    await _reply_update_message_resilient(update, context, "\n".join(lines))
+
+    audit_logger: Optional[AuditLogger] = context.bot_data.get("audit_logger")
+    if audit_logger:
+        await audit_logger.log_command(
+            user_id=user_id, command="queue", args=[], success=True
+        )
+
+
+async def dequeue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /dequeue command - remove one queued task by queue_id."""
+    user_id = _require_effective_user(update).id
+    settings: Settings = context.bot_data["settings"]
+    scope_key, _ = get_scope_state_from_update(
+        user_data=context.user_data,
+        update=update,
+        default_directory=settings.approved_directory,
+    )
+
+    args = [str(arg).strip() for arg in (context.args or []) if str(arg).strip()]
+    if not args:
+        await _reply_update_message_resilient(
+            update, context, "Usage: /dequeue <queue_id>"
+        )
+        return
+
+    queue_id = _parse_queue_id(args[0])
+    if queue_id is None:
+        await _reply_update_message_resilient(
+            update, context, "Invalid queue id. Example: /dequeue 12"
+        )
+        return
+
+    inbound_queue: Optional[InboundTaskQueue] = context.bot_data.get(
+        "inbound_task_queue"
+    )
+    if not inbound_queue:
+        await _reply_update_message_resilient(
+            update, context, "Queue service unavailable."
+        )
+        return
+
+    removed = await inbound_queue.remove(
+        user_id=user_id,
+        scope_key=scope_key,
+        queue_id=queue_id,
+    )
+    if not removed:
+        await _reply_update_message_resilient(
+            update, context, f"Queue item #{queue_id} not found."
+        )
+        success = False
+    else:
+        await _set_update_message_reaction_safe(update, context, emoji="✅")
+        success = True
+
+    audit_logger: Optional[AuditLogger] = context.bot_data.get("audit_logger")
+    if audit_logger:
+        await audit_logger.log_command(
+            user_id=user_id,
+            command="dequeue",
+            args=[str(queue_id)],
+            success=success,
         )
 
 

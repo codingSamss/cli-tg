@@ -8,6 +8,7 @@ import time
 from collections import Counter
 from collections.abc import MutableMapping
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Optional
 from uuid import uuid4
 
@@ -22,6 +23,7 @@ from ...security.audit import AuditLogger
 from ...security.validators import SecurityValidator
 from ...services.session_service import SessionService
 from ...utils.codex_rate_limits import format_rate_limit_summary
+from ..inbound_task_queue import InboundTaskQueue
 from ..utils.cli_engine import (
     ENGINE_CLAUDE,
     ENGINE_CODEX,
@@ -37,6 +39,7 @@ from ..utils.scope_state import (
 from ..utils.telegram_send import (
     is_private_chat_type,
     normalize_message_thread_id,
+    prepare_telegram_text_and_parse_mode,
     send_message_draft_resilient,
     send_message_resilient,
 )
@@ -61,6 +64,8 @@ _AGGREGATION_STATE_TTL_SECONDS = 30
 _CHAT_ACTION_HEARTBEAT_INTERVAL_SECONDS = 4.0
 _AUTO_IMAGE_ATTACHMENTS_LIMIT = 3
 _AUTO_IMAGE_MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024  # Telegram bot document limit
+_INBOUND_QUEUE_DISPATCH_LOCK_KEY = "inbound_queue_dispatch_lock"
+_INBOUND_QUEUE_LAUNCHING_SCOPES_KEY = "inbound_queue_launching_scopes"
 _AUTO_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 _AUTO_IMAGE_PATH_PATTERN = re.compile(
     r"(?P<path>(?:~|/|\.{1,2}/)?[^\s`\"'<>|]+?\.(?:png|jpe?g|webp|gif|bmp))",
@@ -655,6 +660,11 @@ async def _reply_text_resilient(
     chat_type: Optional[str] = None,
 ) -> Any:
     """Send reply text with fallback for Markdown parse and long text errors."""
+    original_text = str(text or "")
+    prepared_text, prepared_parse_mode, html_upgraded_from_markdown = (
+        prepare_telegram_text_and_parse_mode(original_text, parse_mode)
+    )
+
     resolved_bot = bot
     if resolved_bot is None:
         get_bot = getattr(telegram_message, "get_bot", None)
@@ -681,7 +691,7 @@ async def _reply_text_resilient(
         return await send_message_resilient(
             bot=resolved_bot,
             chat_id=message_chat_id,
-            text=text,
+            text=original_text,
             parse_mode=parse_mode,
             reply_markup=reply_markup,
             reply_to_message_id=reply_to_message_id,
@@ -690,29 +700,43 @@ async def _reply_text_resilient(
         )
 
     send_kwargs: dict[str, Any] = {}
-    if parse_mode:
-        send_kwargs["parse_mode"] = parse_mode
+    if prepared_parse_mode:
+        send_kwargs["parse_mode"] = prepared_parse_mode
     if reply_markup is not None:
         send_kwargs["reply_markup"] = reply_markup
     if should_quote_reply and reply_to_message_id is not None:
         send_kwargs["reply_to_message_id"] = reply_to_message_id
 
     try:
-        return await telegram_message.reply_text(text, **send_kwargs)
+        return await telegram_message.reply_text(prepared_text, **send_kwargs)
     except Exception as send_error:
         final_error: Exception = send_error
 
     # Markdown parsing can fail with raw stack traces or unescaped symbols.
-    if parse_mode and _is_markdown_parse_error(final_error):
+    if prepared_parse_mode and _is_markdown_parse_error(final_error):
+        if (
+            html_upgraded_from_markdown
+            and str(parse_mode or "").strip().lower() == "markdown"
+        ):
+            md_kwargs = dict(send_kwargs)
+            md_kwargs["parse_mode"] = "Markdown"
+            try:
+                return await telegram_message.reply_text(original_text, **md_kwargs)
+            except Exception as markdown_error:
+                final_error = markdown_error
+
         no_md_kwargs = dict(send_kwargs)
         no_md_kwargs.pop("parse_mode", None)
         try:
-            return await telegram_message.reply_text(text, **no_md_kwargs)
+            return await telegram_message.reply_text(original_text, **no_md_kwargs)
         except Exception as no_md_error:
             final_error = no_md_error
 
-    if _is_message_too_long_error(final_error) or len(text) > _TELEGRAM_MESSAGE_LIMIT:
-        chunks = _split_text_for_telegram(text)
+    if (
+        _is_message_too_long_error(final_error)
+        or len(original_text) > _TELEGRAM_MESSAGE_LIMIT
+    ):
+        chunks = _split_text_for_telegram(original_text)
         last_message = None
         for idx, chunk in enumerate(chunks):
             chunk_kwargs: dict[str, Any] = {}
@@ -1098,6 +1122,260 @@ def _get_inbound_aggregation_lock(context: ContextTypes.DEFAULT_TYPE) -> asyncio
     created = asyncio.Lock()
     context.bot_data[_INBOUND_AGGREGATION_LOCK_KEY] = created
     return created
+
+
+def _get_inbound_queue_dispatch_lock(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> asyncio.Lock:
+    """Get lock that serializes queue dispatch attempts."""
+    lock = context.bot_data.get(_INBOUND_QUEUE_DISPATCH_LOCK_KEY)
+    if isinstance(lock, asyncio.Lock):
+        return lock
+
+    created = asyncio.Lock()
+    context.bot_data[_INBOUND_QUEUE_DISPATCH_LOCK_KEY] = created
+    return created
+
+
+def _get_inbound_queue_launching_scopes(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> set[str]:
+    """Get/set of scopes currently launching one queued task."""
+    raw = context.bot_data.get(_INBOUND_QUEUE_LAUNCHING_SCOPES_KEY)
+    if isinstance(raw, set):
+        return raw
+
+    created: set[str] = set()
+    context.bot_data[_INBOUND_QUEUE_LAUNCHING_SCOPES_KEY] = created
+    return created
+
+
+def _build_queue_preview(text: str, *, max_length: int = 96) -> str:
+    """Build one-line preview string for queue display."""
+    normalized = " ".join(str(text or "").split())
+    if not normalized:
+        return "(empty)"
+    if len(normalized) <= max_length:
+        return normalized
+    return normalized[: max_length - 3].rstrip() + "..."
+
+
+def _build_queue_remove_keyboard(queue_id: int) -> InlineKeyboardMarkup:
+    """Build inline keyboard for removing one queued task quickly."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "撤回这条排队任务",
+                    callback_data=f"queue:dequeue:{queue_id}",
+                )
+            ]
+        ]
+    )
+
+
+def _build_queued_text_update(
+    *,
+    update: Update,
+    queued_text: str,
+    source_message_id: Optional[int],
+) -> Any:
+    """Build lightweight update clone so replay keeps merged text payload."""
+    original_message = getattr(update, "message", None)
+    message_id = (
+        source_message_id
+        if isinstance(source_message_id, int) and source_message_id > 0
+        else getattr(original_message, "message_id", None)
+    )
+    queued_message = SimpleNamespace(
+        text=queued_text,
+        message_id=message_id,
+        message_thread_id=getattr(original_message, "message_thread_id", None),
+        reply_text=getattr(original_message, "reply_text"),
+        chat=getattr(original_message, "chat", None),
+    )
+    return SimpleNamespace(
+        effective_user=getattr(update, "effective_user", None),
+        effective_chat=getattr(update, "effective_chat", None),
+        effective_message=queued_message,
+        message=queued_message,
+    )
+
+
+async def _enqueue_busy_text_task(
+    *,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    scope_key: str,
+    message_text: str,
+    source_message_id: Optional[int],
+) -> Optional[tuple[int, int]]:
+    """Queue text request and return (queue_id, position) if queue is enabled."""
+    inbound_queue: Optional[InboundTaskQueue] = context.bot_data.get(
+        "inbound_task_queue"
+    )
+    if not isinstance(inbound_queue, InboundTaskQueue):
+        return None
+
+    queued_update = _build_queued_text_update(
+        update=update,
+        queued_text=message_text,
+        source_message_id=source_message_id,
+    )
+
+    async def _replay() -> None:
+        await handle_text_message(queued_update, context)
+
+    queued_item, position = await inbound_queue.enqueue(
+        user_id=user_id,
+        scope_key=scope_key,
+        kind="text",
+        preview=_build_queue_preview(message_text),
+        source_message_id=source_message_id,
+        executor=_replay,
+    )
+    return queued_item.queue_id, position
+
+
+def _build_photo_queue_preview(caption: Optional[str], photo_count: int) -> str:
+    """Build queue preview for photo requests."""
+    normalized_caption = " ".join(str(caption or "").split()).strip()
+    if normalized_caption:
+        return _build_queue_preview(normalized_caption)
+    if photo_count <= 1:
+        return "photo upload"
+    return f"{photo_count} photos"
+
+
+def _build_queued_photo_update(
+    *,
+    update: Update,
+    grouped_photos: list[Any],
+    grouped_caption: Optional[str],
+    source_message_id: Optional[int],
+) -> Any:
+    """Build lightweight update clone for queued photo replay."""
+    original_message = getattr(update, "message", None)
+    message_id = (
+        source_message_id
+        if isinstance(source_message_id, int) and source_message_id > 0
+        else getattr(original_message, "message_id", None)
+    )
+    queued_message = SimpleNamespace(
+        photo=list(grouped_photos),
+        caption=grouped_caption,
+        message_id=message_id,
+        message_thread_id=getattr(original_message, "message_thread_id", None),
+        reply_text=getattr(original_message, "reply_text"),
+        chat=getattr(original_message, "chat", None),
+    )
+    return SimpleNamespace(
+        effective_user=getattr(update, "effective_user", None),
+        effective_chat=getattr(update, "effective_chat", None),
+        effective_message=queued_message,
+        message=queued_message,
+        _queued_grouped_photos=list(grouped_photos),
+        _queued_grouped_caption=grouped_caption,
+        _queued_source_message_id=message_id,
+    )
+
+
+async def _enqueue_busy_photo_task(
+    *,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    scope_key: str,
+    grouped_photos: list[Any],
+    grouped_caption: Optional[str],
+    source_message_id: Optional[int],
+) -> Optional[tuple[int, int]]:
+    """Queue photo request and return (queue_id, position) if queue is enabled."""
+    inbound_queue: Optional[InboundTaskQueue] = context.bot_data.get(
+        "inbound_task_queue"
+    )
+    if not isinstance(inbound_queue, InboundTaskQueue):
+        return None
+
+    queued_update = _build_queued_photo_update(
+        update=update,
+        grouped_photos=grouped_photos,
+        grouped_caption=grouped_caption,
+        source_message_id=source_message_id,
+    )
+
+    async def _replay() -> None:
+        await handle_photo(queued_update, context)
+
+    queued_item, position = await inbound_queue.enqueue(
+        user_id=user_id,
+        scope_key=scope_key,
+        kind="photo",
+        preview=_build_photo_queue_preview(grouped_caption, len(grouped_photos)),
+        source_message_id=source_message_id,
+        executor=_replay,
+    )
+    return queued_item.queue_id, position
+
+
+async def _dispatch_next_inbound_task(
+    *,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    scope_key: str,
+) -> None:
+    """Dispatch one queued task for the scope when there is no running task."""
+    inbound_queue: Optional[InboundTaskQueue] = context.bot_data.get(
+        "inbound_task_queue"
+    )
+    if not isinstance(inbound_queue, InboundTaskQueue):
+        return
+
+    task_registry: Optional[TaskRegistry] = context.bot_data.get("task_registry")
+    dispatch_lock = _get_inbound_queue_dispatch_lock(context)
+    launching_scopes = _get_inbound_queue_launching_scopes(context)
+    queued_item = None
+
+    async with dispatch_lock:
+        if scope_key in launching_scopes:
+            return
+        if task_registry and await task_registry.is_busy(user_id, scope_key=scope_key):
+            return
+
+        queued_item = await inbound_queue.pop_next(user_id=user_id, scope_key=scope_key)
+        if not queued_item:
+            return
+        launching_scopes.add(scope_key)
+
+    async def _run_queued_task() -> None:
+        try:
+            await queued_item.executor()
+        except Exception as exc:
+            logger.error(
+                "Queued task execution failed",
+                error=str(exc),
+                user_id=user_id,
+                scope_key=scope_key,
+                queue_id=queued_item.queue_id,
+            )
+        finally:
+            async with dispatch_lock:
+                _get_inbound_queue_launching_scopes(context).discard(scope_key)
+            await _dispatch_next_inbound_task(
+                context=context,
+                user_id=user_id,
+                scope_key=scope_key,
+            )
+
+    logger.info(
+        "Dispatching queued task",
+        user_id=user_id,
+        scope_key=scope_key,
+        queue_id=queued_item.queue_id,
+        kind=queued_item.kind,
+    )
+    asyncio.create_task(_run_queued_task())
 
 
 def _evict_stale_aggregation_states(
@@ -1494,7 +1772,7 @@ async def _format_progress_update(update_obj: Any) -> Optional[str]:
         safe_preview = _escape_md(content_preview)
         # Keep assistant stream preview concise; engine context is already shown
         # in the message badge/header.
-        return f"💬 {safe_preview}"
+        return f"🤔 {safe_preview}"
 
     elif update_obj.type == "system":
         # System initialization or other system messages
@@ -1591,6 +1869,13 @@ def _get_stream_merge_key(update_obj: Any) -> Optional[str]:
     ):
         return "assistant_content"
     if update_obj.type == "progress":
+        metadata = getattr(update_obj, "metadata", None) or {}
+        if metadata.get("item_type") == "command_execution":
+            command = str(metadata.get("command") or update_obj.content or "").strip()
+            command_head = command.split("\n", 1)[0].strip()
+            if command_head:
+                return f"command_execution:{command_head}"
+            return "command_execution"
         return "progress"
     return None
 
@@ -1629,6 +1914,16 @@ def _append_progress_line_with_merge(
     merge_key: Optional[str],
 ) -> None:
     """Append progress line or merge into previous line when merge key matches."""
+    if merge_key and merge_key.startswith("command_execution"):
+        # Command execution status updates can arrive interleaved.
+        # Replace the latest matching command entry instead of appending
+        # another block, so UI keeps a single line per command.
+        for idx in range(len(progress_merge_keys) - 1, -1, -1):
+            if progress_merge_keys[idx] == merge_key:
+                progress_lines[idx] = progress_text
+                progress_merge_keys[idx] = merge_key
+                return
+
     if (
         merge_key
         and progress_lines
@@ -1645,6 +1940,44 @@ def _append_progress_line_with_merge(
 
     progress_lines.append(progress_text)
     progress_merge_keys.append(merge_key)
+
+
+def _is_command_execution_progress_block(text: str) -> bool:
+    """Whether rendered progress text is a command execution status block."""
+    normalized = str(text or "").strip()
+    return (
+        normalized.startswith("🔧 *Running command*")
+        or normalized.startswith("✅ *Command ")
+        or normalized.startswith("❌ *Command ")
+    )
+
+
+def _is_assistant_progress_block(text: str) -> bool:
+    """Whether rendered line is an assistant narration block."""
+    normalized = str(text or "").strip()
+    return normalized.startswith("🤔 ") or normalized.startswith("💬 ")
+
+
+def _join_progress_lines_for_display(lines: list[str]) -> str:
+    """Join progress lines, adding spacing around command execution blocks."""
+    if not lines:
+        return ""
+
+    rendered_parts: list[str] = [str(lines[0])]
+    for index in range(1, len(lines)):
+        previous = str(lines[index - 1] or "")
+        current = str(lines[index] or "")
+        separator = (
+            "\n\n"
+            if _is_command_execution_progress_block(previous)
+            or _is_command_execution_progress_block(current)
+            or _is_assistant_progress_block(previous)
+            or _is_assistant_progress_block(current)
+            else "\n"
+        )
+        rendered_parts.append(separator)
+        rendered_parts.append(current)
+    return "".join(rendered_parts)
 
 
 def _build_context_tag(
@@ -2156,14 +2489,39 @@ async def handle_text_message(
     typing_stop_event = asyncio.Event()
     typing_heartbeat_task: Optional[asyncio.Task] = None
     reaction_controller: Optional[_MessageStatusReactionController] = None
+    progress_msg: Any = None
+    all_progress_lines: list[str] = []
+    frozen_messages: list[Any] = []
 
     try:
         # Check if user already has an active task
         task_registry: Optional[TaskRegistry] = context.bot_data.get("task_registry")
         if task_registry and await task_registry.is_busy(user_id, scope_key=scope_key):
-            await _reply_text_resilient(
-                telegram_message, "A task is already running. Use /cancel to cancel it."
+            queued_meta = await _enqueue_busy_text_task(
+                update=update,
+                context=context,
+                user_id=user_id,
+                scope_key=scope_key,
+                message_text=message_text,
+                source_message_id=input_message_id,
             )
+            if queued_meta is None:
+                await _reply_text_resilient(
+                    telegram_message,
+                    "A task is already running. Use /cancel to cancel it.",
+                )
+            else:
+                queue_id, position = queued_meta
+                pending_before = max(position - 1, 0)
+                await _reply_text_resilient(
+                    telegram_message,
+                    (
+                        f"Task is running, queued as #{queue_id}. "
+                        f"{pending_before} task(s) ahead. "
+                        f"Use /queue to view, /dequeue {queue_id} to remove."
+                    ),
+                    reply_markup=_build_queue_remove_keyboard(queue_id),
+                )
             return
 
         # Keep typing indicator alive while the thinking/progress flow is running.
@@ -2238,8 +2596,9 @@ async def handle_text_message(
         # Enhanced stream updates handler with accumulated progress tracking
         progress_lines: list[str] = []
         progress_merge_keys: list[Optional[str]] = []
-        all_progress_lines: list[str] = []  # 完整思考过程（不受溢出 clear 影响）
-        frozen_messages: list = []  # 被冻结的旧进度消息
+        all_progress_lines = []  # 完整思考过程（不受溢出 clear 影响）
+        all_progress_merge_keys: list[Optional[str]] = []
+        frozen_messages = []  # 被冻结的旧进度消息
         last_progress_text = ""
         pending_progress_text: Optional[str] = None
         progress_flush_task: Optional[asyncio.Task] = None
@@ -2379,8 +2738,15 @@ async def handle_text_message(
                     and update_obj.content
                     and not update_obj.tool_calls
                 ):
-                    all_progress_lines.append(progress_text)
-                full_text = _with_engine_badge("\n".join(progress_lines), active_engine)
+                    _append_progress_line_with_merge(
+                        progress_lines=all_progress_lines,
+                        progress_merge_keys=all_progress_merge_keys,
+                        progress_text=progress_text,
+                        merge_key=merge_key,
+                    )
+                full_text = _with_engine_badge(
+                    _join_progress_lines_for_display(progress_lines), active_engine
+                )
 
                 # If accumulated text exceeds Telegram limit, freeze current
                 # message and start a new one
@@ -2909,6 +3275,11 @@ async def handle_text_message(
                 await typing_heartbeat_task
             except asyncio.CancelledError:
                 pass
+        await _dispatch_next_inbound_task(
+            context=context,
+            user_id=user_id,
+            scope_key=scope_key,
+        )
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3259,12 +3630,29 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     user_id = effective_user.id
-    (
-        media_group_ready,
-        grouped_photos,
-        grouped_caption,
-        source_message_id,
-    ) = await _collect_media_group_photos(update, context)
+    queued_grouped_photos = getattr(update, "_queued_grouped_photos", None)
+    queued_grouped_caption = getattr(update, "_queued_grouped_caption", None)
+    queued_source_message_id = getattr(update, "_queued_source_message_id", None)
+    if isinstance(queued_grouped_photos, list) and queued_grouped_photos:
+        media_group_ready = True
+        grouped_photos = list(queued_grouped_photos)
+        grouped_caption = (
+            str(queued_grouped_caption)
+            if isinstance(queued_grouped_caption, str)
+            else None
+        )
+        source_message_id = (
+            int(queued_source_message_id)
+            if isinstance(queued_source_message_id, int)
+            else getattr(telegram_message, "message_id", None)
+        )
+    else:
+        (
+            media_group_ready,
+            grouped_photos,
+            grouped_caption,
+            source_message_id,
+        ) = await _collect_media_group_photos(update, context)
     if not media_group_ready:
         return
 
@@ -3297,14 +3685,38 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if image_handler:
         task_registry: Optional[TaskRegistry] = context.bot_data.get("task_registry")
         if task_registry and await task_registry.is_busy(user_id, scope_key=scope_key):
-            await _reply_text_resilient(
-                telegram_message, "A task is already running. Use /cancel to cancel it."
+            queued_meta = await _enqueue_busy_photo_task(
+                update=update,
+                context=context,
+                user_id=user_id,
+                scope_key=scope_key,
+                grouped_photos=grouped_photos,
+                grouped_caption=grouped_caption,
+                source_message_id=reply_target_message_id,
             )
+            if queued_meta is None:
+                await _reply_text_resilient(
+                    telegram_message,
+                    "A task is already running. Use /cancel to cancel it.",
+                )
+            else:
+                queue_id, position = queued_meta
+                pending_before = max(position - 1, 0)
+                await _reply_text_resilient(
+                    telegram_message,
+                    (
+                        f"Task is running, queued as #{queue_id}. "
+                        f"{pending_before} task(s) ahead. "
+                        f"Use /queue to view, /dequeue {queue_id} to remove."
+                    ),
+                    reply_markup=_build_queue_remove_keyboard(queue_id),
+                )
             return
 
         try:
             last_status_text = ""
             thinking_lines: list[str] = []
+            thinking_merge_keys: list[Optional[str]] = []
             progress_msg: Any = None
             cancel_keyboard = InlineKeyboardMarkup(
                 [[InlineKeyboardButton("Cancel", callback_data="cancel:task")]]
@@ -3493,14 +3905,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                         merge_key=merge_key,
                     )
                     full_text = _with_engine_badge(
-                        "\n".join(progress_lines), active_engine
+                        _join_progress_lines_for_display(progress_lines), active_engine
                     )
                     while len(full_text) > 3800 and progress_lines:
                         progress_lines.pop(0)
                         if progress_merge_keys:
                             progress_merge_keys.pop(0)
                         full_text = _with_engine_badge(
-                            "\n".join(progress_lines), active_engine
+                            _join_progress_lines_for_display(progress_lines),
+                            active_engine,
                         )
                     if full_text == last_status_text:
                         return
@@ -3513,7 +3926,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                         and update_obj.content
                         and not update_obj.tool_calls
                     ):
-                        thinking_lines.append(progress_text)
+                        _append_progress_line_with_merge(
+                            progress_lines=thinking_lines,
+                            progress_merge_keys=thinking_merge_keys,
+                            progress_text=progress_text,
+                            merge_key=merge_key,
+                        )
 
                     if _is_high_priority_stream_update(update_obj):
                         await _cancel_stream_flush_task()
@@ -4001,6 +4419,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     locals().get("active_engine", ENGINE_CLAUDE),
                 ),
                 parse_mode="Markdown",
+            )
+        finally:
+            await _dispatch_next_inbound_task(
+                context=context,
+                user_id=user_id,
+                scope_key=scope_key,
             )
     else:
         # Fall back to unsupported message

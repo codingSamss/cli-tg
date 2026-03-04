@@ -18,15 +18,19 @@ from src.bot.handlers.message import (
     _format_progress_update,
     _get_stream_merge_key,
     _is_high_priority_stream_update,
-    _is_turn_started_update,
     _is_markdown_parse_error,
     _is_noop_edit_error,
+    _is_turn_started_update,
+    _join_progress_lines_for_display,
     _reply_text_resilient,
     _resolve_collapsed_fallback_model,
     _send_private_final_response_draft,
     _split_text_for_telegram,
     _with_engine_badge,
+    handle_photo,
+    handle_text_message,
 )
+from src.bot.inbound_task_queue import InboundTaskQueue
 from src.bot.utils.cli_engine import ENGINE_CLAUDE, ENGINE_CODEX
 
 
@@ -92,7 +96,7 @@ async def test_assistant_progress_text_uses_codex_label_when_metadata_present():
     text = await _format_progress_update(update)
 
     assert text is not None
-    assert text == "💬 partial response"
+    assert text == "🤔 partial response"
 
 
 @pytest.mark.asyncio
@@ -177,8 +181,239 @@ async def test_progress_command_execution_renders_completion_exit_code():
     assert "exit 0" in text
 
 
+@pytest.mark.asyncio
+async def test_handle_text_message_fallback_does_not_crash_when_progress_init_fails(
+    tmp_path, monkeypatch
+):
+    """Early progress-message failure should not trigger secondary UnboundLocalError."""
+    approved = tmp_path / "approved"
+    approved.mkdir()
+
+    message = SimpleNamespace(
+        text="trigger fallback",
+        message_id=11,
+        message_thread_id=None,
+        chat=SimpleNamespace(send_action=AsyncMock()),
+    )
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=10001),
+        message=message,
+        effective_chat=SimpleNamespace(id=10001, type="private"),
+        effective_message=message,
+    )
+    context = SimpleNamespace(
+        bot_data={
+            "settings": SimpleNamespace(
+                approved_directory=approved,
+                stream_render_debounce_ms=0,
+                stream_render_min_edit_interval_ms=0,
+                status_reactions_enabled=False,
+            )
+        },
+        user_data={},
+        bot=SimpleNamespace(),
+    )
+
+    reply_calls = {"count": 0}
+
+    async def _fake_reply(*args, **kwargs):
+        reply_calls["count"] += 1
+        if reply_calls["count"] == 1:
+            raise RuntimeError("progress message init failed")
+        return SimpleNamespace()
+
+    monkeypatch.setattr(
+        "src.bot.handlers.message.get_cli_integration",
+        lambda **_: (ENGINE_CODEX, SimpleNamespace()),
+    )
+    monkeypatch.setattr("src.bot.handlers.message._reply_text_resilient", _fake_reply)
+    set_reaction = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "src.bot.handlers.message._set_message_reaction_safe", set_reaction
+    )
+
+    await handle_text_message(update, context)
+
+    assert reply_calls["count"] >= 2
+    set_reaction.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_handle_text_message_busy_state_queues_request(tmp_path, monkeypatch):
+    """Busy text request should be queued with a removable queue id."""
+    approved = tmp_path / "approved"
+    approved.mkdir()
+
+    message = SimpleNamespace(
+        text="please queue me",
+        message_id=21,
+        message_thread_id=None,
+        chat=SimpleNamespace(send_action=AsyncMock()),
+        reply_text=AsyncMock(),
+    )
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=11001),
+        message=message,
+        effective_chat=SimpleNamespace(id=11001, type="private"),
+        effective_message=message,
+    )
+    task_registry = SimpleNamespace(is_busy=AsyncMock(return_value=True))
+    inbound_queue = InboundTaskQueue()
+    context = SimpleNamespace(
+        bot_data={
+            "settings": SimpleNamespace(
+                approved_directory=approved,
+                stream_render_debounce_ms=0,
+                stream_render_min_edit_interval_ms=0,
+                status_reactions_enabled=False,
+            ),
+            "task_registry": task_registry,
+            "inbound_task_queue": inbound_queue,
+        },
+        user_data={},
+        bot=SimpleNamespace(),
+    )
+
+    sent_texts: list[str] = []
+    sent_kwargs: list[dict] = []
+
+    async def _fake_reply(_message, text, *args, **kwargs):
+        sent_texts.append(str(text))
+        sent_kwargs.append(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr("src.bot.handlers.message._reply_text_resilient", _fake_reply)
+
+    await handle_text_message(update, context)
+
+    queued_items = await inbound_queue.list_items(
+        user_id=11001, scope_key="11001:11001:0"
+    )
+    assert len(queued_items) == 1
+    assert queued_items[0].kind == "text"
+    assert sent_texts
+    assert "queued as #" in sent_texts[0]
+    reply_markup = sent_kwargs[0].get("reply_markup")
+    assert reply_markup is not None
+    assert reply_markup.inline_keyboard[0][0].callback_data == "queue:dequeue:1"
+
+
+@pytest.mark.asyncio
+async def test_handle_photo_busy_state_queues_request(tmp_path, monkeypatch):
+    """Busy photo request should be queued with queue id."""
+    approved = tmp_path / "approved"
+    approved.mkdir()
+
+    photo_obj = SimpleNamespace(file_id="photo-1")
+    message = SimpleNamespace(
+        photo=[photo_obj],
+        caption="check this screenshot",
+        media_group_id=None,
+        message_id=31,
+        message_thread_id=None,
+        chat=SimpleNamespace(send_action=AsyncMock()),
+        reply_text=AsyncMock(),
+    )
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=12001),
+        message=message,
+        effective_chat=SimpleNamespace(id=12001, type="private"),
+        effective_message=message,
+    )
+    task_registry = SimpleNamespace(is_busy=AsyncMock(return_value=True))
+    inbound_queue = InboundTaskQueue()
+    context = SimpleNamespace(
+        bot_data={
+            "settings": SimpleNamespace(
+                approved_directory=approved,
+                stream_render_debounce_ms=0,
+                stream_render_min_edit_interval_ms=0,
+                status_reactions_enabled=False,
+            ),
+            "features": SimpleNamespace(get_image_handler=lambda: object()),
+            "task_registry": task_registry,
+            "inbound_task_queue": inbound_queue,
+        },
+        user_data={},
+        bot=SimpleNamespace(),
+    )
+
+    sent_texts: list[str] = []
+    sent_kwargs: list[dict] = []
+
+    async def _fake_reply(_message, text, *args, **kwargs):
+        sent_texts.append(str(text))
+        sent_kwargs.append(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr("src.bot.handlers.message._reply_text_resilient", _fake_reply)
+
+    await handle_photo(update, context)
+
+    queued_items = await inbound_queue.list_items(
+        user_id=12001, scope_key="12001:12001:0"
+    )
+    assert len(queued_items) == 1
+    assert queued_items[0].kind == "photo"
+    assert sent_texts
+    assert "queued as #" in sent_texts[0]
+    reply_markup = sent_kwargs[0].get("reply_markup")
+    assert reply_markup is not None
+    assert reply_markup.inline_keyboard[0][0].callback_data == "queue:dequeue:1"
+
+
+def test_join_progress_lines_for_display_adds_spacing_around_command_blocks():
+    """Command blocks should keep one blank line before and after for readability."""
+    rendered = _join_progress_lines_for_display(
+        [
+            "🤔 preparing checks",
+            "🔧 *Running command*\n\n`/bin/zsh -lc 'git status --short --branch'`",
+            "✅ *Command completed* \\(exit 0\\)\n\n`/bin/zsh -lc 'git status --short --branch'`",
+            "🤔 moving to next step",
+        ]
+    )
+
+    assert "🤔 preparing checks\n\n🔧 *Running command*" in rendered
+    assert (
+        "`/bin/zsh -lc 'git status --short --branch'`\n\n✅ *Command completed*"
+        in rendered
+    )
+    assert (
+        "`/bin/zsh -lc 'git status --short --branch'`\n\n🤔 moving to next step"
+        in rendered
+    )
+
+
+def test_join_progress_lines_for_display_keeps_non_command_lines_compact():
+    """Non-command and non-assistant lines should preserve compact spacing."""
+    rendered = _join_progress_lines_for_display(
+        ["🤖 *Codex is working...*", "🔄 *step 1*", "✅ *done*"]
+    )
+
+    assert rendered == "🤖 *Codex is working...*\n🔄 *step 1*\n✅ *done*"
+
+
+def test_join_progress_lines_for_display_adds_spacing_around_assistant_blocks():
+    """Assistant narration lines should be separated by one blank line."""
+    rendered = _join_progress_lines_for_display(
+        [
+            "🔄 Checking Markdown compatibility",
+            "🤔 我先检查 parse_mode 配置",
+            "🔄 Investigating Markdown parsing fallback",
+            "🤔 已定位到兜底逻辑",
+        ]
+    )
+
+    assert (
+        rendered == "🔄 Checking Markdown compatibility\n\n"
+        "🤔 我先检查 parse_mode 配置\n\n"
+        "🔄 Investigating Markdown parsing fallback\n\n"
+        "🤔 已定位到兜底逻辑"
+    )
+
+
 def test_get_stream_merge_key_for_mergeable_events():
-    """Progress and assistant plain content should be mergeable."""
+    """Assistant and non-command progress updates should be mergeable."""
     assistant_update = _FakeUpdate(
         type="assistant",
         content="partial",
@@ -194,6 +429,24 @@ def test_get_stream_merge_key_for_mergeable_events():
     assert _get_stream_merge_key(assistant_update) == "assistant_content"
     assert _get_stream_merge_key(progress_update) == "progress"
     assert _get_stream_merge_key(tool_update) is None
+
+
+def test_get_stream_merge_key_for_command_execution_uses_command_identity():
+    """Command execution updates should merge by command identity."""
+    command_update = _FakeUpdate(
+        type="progress",
+        content="/bin/zsh -lc 'make lint'",
+        metadata={
+            "item_type": "command_execution",
+            "status": "in_progress",
+            "command": "/bin/zsh -lc 'make lint'",
+        },
+    )
+
+    key = _get_stream_merge_key(command_update)
+    assert key is not None
+    assert key.startswith("command_execution:")
+    assert "make lint" in key
 
 
 def test_append_progress_line_with_merge_merges_only_consecutive_same_key():
@@ -240,6 +493,73 @@ def test_append_progress_line_with_merge_merges_only_consecutive_same_key():
 
     assert lines == ["🤖 second", "🔄 step 2", "✅ done", "✅ done again"]
     assert merge_keys == ["assistant_content", "progress", None, None]
+
+
+def test_append_progress_line_with_merge_collapses_command_status_updates():
+    """Consecutive status updates of the same command should keep latest state only."""
+    lines: list[str] = []
+    merge_keys: list[Optional[str]] = []
+    command_key = "command_execution:/bin/zsh -lc 'make lint'"
+
+    _append_progress_line_with_merge(
+        progress_lines=lines,
+        progress_merge_keys=merge_keys,
+        progress_text="🔧 *Running command*\n\n`/bin/zsh -lc 'make lint'`",
+        merge_key=command_key,
+    )
+    _append_progress_line_with_merge(
+        progress_lines=lines,
+        progress_merge_keys=merge_keys,
+        progress_text="✅ *Command completed* \\(exit 0\\)\n\n`/bin/zsh -lc 'make lint'`",
+        merge_key=command_key,
+    )
+
+    assert lines == [
+        "✅ *Command completed* \\(exit 0\\)\n\n`/bin/zsh -lc 'make lint'`"
+    ]
+    assert merge_keys == [command_key]
+
+
+def test_append_progress_line_with_merge_collapses_interleaved_command_updates():
+    """Interleaved command updates should still keep one latest line per command."""
+    lines: list[str] = []
+    merge_keys: list[Optional[str]] = []
+    key_a = "command_execution:/bin/zsh -lc 'rg -n foo src'"
+    key_b = "command_execution:/bin/zsh -lc 'sed -n 1,200p app.py'"
+
+    _append_progress_line_with_merge(
+        progress_lines=lines,
+        progress_merge_keys=merge_keys,
+        progress_text="🔧 *Running command*\n\n`/bin/zsh -lc 'rg -n foo src'`",
+        merge_key=key_a,
+    )
+    _append_progress_line_with_merge(
+        progress_lines=lines,
+        progress_merge_keys=merge_keys,
+        progress_text="🔧 *Running command*\n\n`/bin/zsh -lc 'sed -n 1,200p app.py'`",
+        merge_key=key_b,
+    )
+    _append_progress_line_with_merge(
+        progress_lines=lines,
+        progress_merge_keys=merge_keys,
+        progress_text="✅ *Command completed* \\(exit 0\\)\n\n`/bin/zsh -lc 'rg -n foo src'`",
+        merge_key=key_a,
+    )
+    _append_progress_line_with_merge(
+        progress_lines=lines,
+        progress_merge_keys=merge_keys,
+        progress_text=(
+            "✅ *Command completed* \\(exit 0\\)\n\n"
+            "`/bin/zsh -lc 'sed -n 1,200p app.py'`"
+        ),
+        merge_key=key_b,
+    )
+
+    assert lines == [
+        "✅ *Command completed* \\(exit 0\\)\n\n`/bin/zsh -lc 'rg -n foo src'`",
+        "✅ *Command completed* \\(exit 0\\)\n\n`/bin/zsh -lc 'sed -n 1,200p app.py'`",
+    ]
+    assert merge_keys == [key_a, key_b]
 
 
 def test_append_progress_line_with_merge_skips_exact_consecutive_duplicates():
