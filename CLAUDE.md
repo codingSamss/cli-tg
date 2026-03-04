@@ -189,6 +189,12 @@ Pydantic Settings v2 从环境变量加载（`src/config/settings.py`）。必�
 - pytest-asyncio，`asyncio_mode = "auto"`，测试中用 `AsyncMock` 模拟异步方法
 - structlog 结构化日志（生产 JSON，开发控制台），`SensitiveLogFilter` 脱敏 bot token
 
+## Git 提交与合并约定（强制）
+
+- Commit 标题保持 Conventional Commits 风格；**commit 备注正文必须使用中文**，明确记录动机、改动范围、验证结论。
+- 合并到主干时必须保留分支轨迹：使用 `git merge --no-ff <branch>`（或等效 Merge PR），不要 fast-forward 抹平历史。
+- 当前主干分支是 `master`（若后续迁移到 `main`，同样遵循以上规则）。
+
 ## 提交前隐私安全检查（强制）
 
 - 提交前必须检查本次变更是否包含敏感信息：`token`、`secret`、`password`、`api key`、`cookie`、`authorization`、私钥、个人隐私数据。

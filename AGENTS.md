@@ -37,6 +37,11 @@
 提交信息遵循约定式提交（Conventional Commits），历史中常见前缀：`feat:`、`fix:`、`refactor:`、`docs:`、`test:`、`chore:`。示例：`feat: add session export command`。  
 发起合并请求（Pull Request）时请包含：变更目的、关联 Issue、测试结果（至少 `make test` 与 `make lint`）、必要文档更新。若变更影响 Telegram 交互流程，附上关键聊天截图或日志片段。
 
+### 提交与主干合并约定（强制）
+- Commit 标题可遵循 Conventional Commits 英文前缀，但 **commit 备注正文必须使用中文**，至少说明变更动机、主要改动点与验证结果。
+- 合并到主干时，必须保留可追溯的分支合并记录：使用 `git merge --no-ff <branch>`（或等效 Merge PR），禁止使用 fast-forward 直接“抹平”分支历史。
+- 当前仓库主干分支为 `master`；若后续切换为 `main`，沿用同样规则。
+
 ## 安全与配置提示
 从 `.env.example` 复制生成 `.env`，严禁提交令牌、密钥或真实凭据。重点检查 `ALLOWED_USERS` 与 `APPROVED_DIRECTORY`，避免越权访问。涉及 Claude 命令执行路径时，优先使用本地 `claude-wrapper.sh` 并在提交前确认未泄露敏感配置。
 
