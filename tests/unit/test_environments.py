@@ -22,7 +22,7 @@ def test_testing_config():
     assert config_dict["database_url"] == "sqlite:///:memory:"
     assert config_dict["approved_directory"] == "/tmp/test_projects"
     assert config_dict["enable_telemetry"] is False
-    assert config_dict["claude_timeout_seconds"] == 30
+    assert config_dict["cli_timeout_seconds"] == 30
 
 
 def test_production_config():

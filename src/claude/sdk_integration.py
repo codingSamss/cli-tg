@@ -43,7 +43,7 @@ from claude_agent_sdk import (
     query,
 )
 
-from ..config.settings import Settings
+from ..config.settings import Settings, resolve_cli_timeout_seconds
 from .exceptions import (
     ClaudeMCPError,
     ClaudeParsingError,
@@ -381,6 +381,7 @@ class ClaudeSDKManager:
             session_id=session_id,
             continue_session=continue_session,
         )
+        timeout_seconds = max(1, resolve_cli_timeout_seconds(self.config))
 
         try:
             # Build Claude Agent options
@@ -439,7 +440,7 @@ class ClaudeSDKManager:
                 self._execute_query_with_streaming(
                     query_prompt, options, messages, stream_callback
                 ),
-                timeout=self.config.claude_timeout_seconds,
+                timeout=timeout_seconds,
             )
 
             # Extract cost, tools, and session_id from result message
@@ -505,11 +506,9 @@ class ClaudeSDKManager:
         except asyncio.TimeoutError:
             logger.error(
                 "Claude SDK command timed out",
-                timeout_seconds=self.config.claude_timeout_seconds,
+                timeout_seconds=timeout_seconds,
             )
-            raise ClaudeTimeoutError(
-                f"Claude SDK timed out after {self.config.claude_timeout_seconds}s"
-            )
+            raise ClaudeTimeoutError(f"Claude SDK timed out after {timeout_seconds}s")
 
         except CLINotFoundError as e:
             logger.error("Claude CLI not found", error=str(e))
@@ -1126,6 +1125,7 @@ class ClaudeSDKManager:
             continue_session=continue_session,
             has_permission_callback=bool(permission_callback),
         )
+        timeout_seconds = max(1, resolve_cli_timeout_seconds(self.config))
 
         try:
             cli_path = find_claude_cli(self.config.claude_cli_path)
@@ -1159,12 +1159,12 @@ class ClaudeSDKManager:
             messages: List[Message] = []
             client = ClaudeSDKClient(options)
             model_resolved_emitted = False
-            disconnect_timeout = max(1, min(10, self.config.claude_timeout_seconds))
+            disconnect_timeout = max(1, min(10, timeout_seconds))
             try:
                 # connect() without prompt — establishes connection only
                 await asyncio.wait_for(
                     client.connect(),
-                    timeout=self.config.claude_timeout_seconds,
+                    timeout=timeout_seconds,
                 )
 
                 async def _query_and_collect_messages() -> None:
@@ -1206,7 +1206,7 @@ class ClaudeSDKManager:
 
                 await asyncio.wait_for(
                     _query_and_collect_messages(),
-                    timeout=self.config.claude_timeout_seconds,
+                    timeout=timeout_seconds,
                 )
             finally:
                 try:
@@ -1278,11 +1278,10 @@ class ClaudeSDKManager:
         except asyncio.TimeoutError:
             logger.error(
                 "Claude SDK Client timed out",
-                timeout_seconds=self.config.claude_timeout_seconds,
+                timeout_seconds=timeout_seconds,
             )
             raise ClaudeTimeoutError(
-                f"Claude SDK Client timed out after "
-                f"{self.config.claude_timeout_seconds}s"
+                f"Claude SDK Client timed out after {timeout_seconds}s"
             )
 
         except CLINotFoundError as e:

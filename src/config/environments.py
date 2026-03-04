@@ -9,7 +9,7 @@ class DevelopmentConfig:
     debug: bool = True
     development_mode: bool = True
     log_level: str = "DEBUG"
-    claude_timeout_seconds: int = 600  # Longer timeout for debugging
+    cli_timeout_seconds: int = 3600  # Longer timeout for long CLI tasks
     enable_telemetry: bool = False
 
     @classmethod
@@ -32,7 +32,7 @@ class TestingConfig:
     database_url: str = "sqlite:///:memory:"
     approved_directory: str = "/tmp/test_projects"
     enable_telemetry: bool = False
-    claude_timeout_seconds: int = 30  # Faster timeout for tests
+    cli_timeout_seconds: int = 30  # Faster timeout for tests
     session_timeout_hours: int = 1  # Short session timeout for testing
 
     @classmethod

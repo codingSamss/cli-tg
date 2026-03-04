@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional
 
 import structlog
 
-from ..config.settings import Settings
+from ..config.settings import Settings, resolve_cli_timeout_seconds
 from .exceptions import ClaudeProcessError, ClaudeToolValidationError
 from .integration import ClaudeProcessManager, ClaudeResponse
 from .monitor import ToolMonitor
@@ -728,7 +728,7 @@ class ClaudeIntegration:
             1,
         )
         probe_timeout = max(
-            1, min(self.config.claude_timeout_seconds, probe_timeout_cfg)
+            1, min(resolve_cli_timeout_seconds(self.config), probe_timeout_cfg)
         )
         probe_runners: List[tuple[str, Callable[[], Any]]] = []
         process_manager = self.process_manager

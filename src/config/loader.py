@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 from src.exceptions import ConfigurationError, InvalidConfigError
 
 from .environments import DevelopmentConfig, ProductionConfig, TestingConfig
-from .settings import Settings
+from .settings import Settings, resolve_cli_timeout_seconds
 
 logger = structlog.get_logger()
 
@@ -123,8 +123,8 @@ def _validate_config(settings: Settings) -> None:
             # Ensure parent directory exists
             db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if settings.claude_timeout_seconds <= 0:
-        raise InvalidConfigError("claude_timeout_seconds must be positive")
+    if resolve_cli_timeout_seconds(settings) <= 0:
+        raise InvalidConfigError("cli_timeout_seconds must be positive")
 
 
 def _get_enabled_features_summary(settings: Settings) -> list[str]:

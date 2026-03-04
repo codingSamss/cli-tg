@@ -12,12 +12,12 @@ import json
 from pathlib import Path
 from typing import Any, List, Optional
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from src.utils.constants import (
     DEFAULT_CLAUDE_MAX_TURNS,
-    DEFAULT_CLAUDE_TIMEOUT_SECONDS,
+    DEFAULT_CLI_TIMEOUT_SECONDS,
     DEFAULT_DATABASE_URL,
     DEFAULT_MAX_SESSIONS_PER_USER,
     DEFAULT_SESSION_TIMEOUT_HOURS,
@@ -32,6 +32,10 @@ class Settings(BaseSettings):
         ..., description="Telegram bot token from BotFather"
     )
     telegram_bot_username: str = Field(..., description="Bot username without @")
+    telegram_parse_mode: str = Field(
+        "Markdown",
+        description="Telegram parse mode preference: Markdown or HTML",
+    )
 
     # Security
     approved_directory: Path = Field(..., description="Base directory for projects")
@@ -63,8 +67,15 @@ class Settings(BaseSettings):
     claude_max_turns: int = Field(
         DEFAULT_CLAUDE_MAX_TURNS, description="Max conversation turns"
     )
-    claude_timeout_seconds: int = Field(
-        DEFAULT_CLAUDE_TIMEOUT_SECONDS, description="Claude timeout"
+    cli_timeout_seconds: int = Field(
+        DEFAULT_CLI_TIMEOUT_SECONDS,
+        description="CLI timeout in seconds",
+        validation_alias=AliasChoices(
+            "cli_timeout_seconds",
+            "claude_timeout_seconds",
+            "CLI_TIMEOUT_SECONDS",
+            "CLAUDE_TIMEOUT_SECONDS",
+        ),
     )
     use_sdk: bool = Field(True, description="Use Python SDK instead of CLI subprocess")
     sdk_enable_tool_permission_gate: bool = Field(
@@ -301,6 +312,15 @@ class Settings(BaseSettings):
             raise ValueError(f"log_level must be one of {valid_levels}")
         return v.upper()  # type: ignore[no-any-return]
 
+    @field_validator("telegram_parse_mode")
+    @classmethod
+    def validate_telegram_parse_mode(cls, v: Any) -> str:
+        """Validate Telegram parse mode preference."""
+        normalized = str(v or "").strip().upper()
+        if normalized not in {"MARKDOWN", "HTML"}:
+            raise ValueError("telegram_parse_mode must be Markdown or HTML")
+        return "HTML" if normalized == "HTML" else "Markdown"
+
     @model_validator(mode="after")
     def validate_cross_field_dependencies(self) -> "Settings":
         """Validate dependencies between fields."""
@@ -309,6 +329,16 @@ class Settings(BaseSettings):
             raise ValueError("mcp_config_path required when enable_mcp is True")
 
         return self
+
+    @property
+    def claude_timeout_seconds(self) -> int:
+        """Backward-compatible alias for legacy timeout naming."""
+        return int(self.cli_timeout_seconds)
+
+    @claude_timeout_seconds.setter
+    def claude_timeout_seconds(self, value: int) -> None:
+        """Backward-compatible setter for legacy timeout naming."""
+        self.cli_timeout_seconds = int(value)
 
     @property
     def is_production(self) -> bool:
@@ -336,3 +366,17 @@ class Settings(BaseSettings):
             if self.anthropic_api_key
             else None
         )
+
+
+def resolve_cli_timeout_seconds(config: Any) -> int:
+    """Resolve CLI timeout from generic or legacy config attribute names."""
+    raw_value = getattr(config, "cli_timeout_seconds", None)
+    if raw_value is None:
+        raw_value = getattr(config, "claude_timeout_seconds", None)
+    if raw_value is None:
+        return DEFAULT_CLI_TIMEOUT_SECONDS
+    try:
+        parsed = int(raw_value)
+    except (TypeError, ValueError):
+        return DEFAULT_CLI_TIMEOUT_SECONDS
+    return parsed

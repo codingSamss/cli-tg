@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from src.bot.utils.telegram_send import (
+    prepare_telegram_text_and_parse_mode,
     send_message_draft_resilient,
     send_message_resilient,
     trim_draft_text_for_telegram,
@@ -108,6 +109,84 @@ async def test_send_message_draft_resilient_parse_mode_fallback():
     second_payload = bot._post.await_args_list[1].args[1]
     assert first_payload["parse_mode"] == "Markdown"
     assert "parse_mode" not in second_payload
+
+
+def test_prepare_telegram_text_and_parse_mode_switches_to_html(monkeypatch):
+    """Markdown content should be converted when TELEGRAM_PARSE_MODE=HTML."""
+    monkeypatch.setenv("TELEGRAM_PARSE_MODE", "HTML")
+
+    text, parse_mode, upgraded = prepare_telegram_text_and_parse_mode(
+        "*Bold* with `code` and [site](https://example.com)",
+        "Markdown",
+    )
+
+    assert upgraded is True
+    assert parse_mode == "HTML"
+    assert "<b>Bold</b>" in text
+    assert "<code>code</code>" in text
+    assert '<a href="https://example.com">site</a>' in text
+
+
+@pytest.mark.asyncio
+async def test_send_message_resilient_html_upgrade_falls_back_to_markdown(monkeypatch):
+    """When HTML parse fails, should retry with original Markdown before plain text."""
+    monkeypatch.setenv("TELEGRAM_PARSE_MODE", "HTML")
+    bot = SimpleNamespace(
+        send_message=AsyncMock(
+            side_effect=[Exception("can't parse entities"), object()]
+        )
+    )
+
+    await send_message_resilient(
+        bot=bot,
+        chat_id=12345,
+        text="*hello*",
+        parse_mode="Markdown",
+        chat_type="private",
+    )
+
+    assert bot.send_message.await_count == 2
+    first_kwargs = bot.send_message.await_args_list[0].kwargs
+    second_kwargs = bot.send_message.await_args_list[1].kwargs
+    assert first_kwargs["parse_mode"] == "HTML"
+    assert "<b>hello</b>" in first_kwargs["text"]
+    assert second_kwargs["parse_mode"] == "Markdown"
+    assert second_kwargs["text"] == "*hello*"
+
+
+@pytest.mark.asyncio
+async def test_send_message_draft_resilient_html_upgrade_falls_back_to_markdown_then_plain(
+    monkeypatch,
+):
+    """Draft updates should fallback HTML -> Markdown -> plain text."""
+    monkeypatch.setenv("TELEGRAM_PARSE_MODE", "HTML")
+    bot = SimpleNamespace(
+        _post=AsyncMock(
+            side_effect=[
+                Exception("can't parse entities"),
+                Exception("can't parse entities"),
+                True,
+            ]
+        )
+    )
+
+    sent = await send_message_draft_resilient(
+        bot=bot,
+        chat_id=12345,
+        draft_id=9,
+        text="*hello*",
+        parse_mode="Markdown",
+        chat_type="private",
+    )
+
+    assert sent is True
+    first_payload = bot._post.await_args_list[0].args[1]
+    second_payload = bot._post.await_args_list[1].args[1]
+    third_payload = bot._post.await_args_list[2].args[1]
+    assert first_payload["parse_mode"] == "HTML"
+    assert second_payload["parse_mode"] == "Markdown"
+    assert "parse_mode" not in third_payload
+    assert third_payload["text"] == "*hello*"
 
 
 def test_trim_draft_text_for_telegram_adds_ellipsis():

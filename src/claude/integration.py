@@ -20,7 +20,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional
 
 import structlog
 
-from ..config.settings import Settings
+from ..config.settings import Settings, resolve_cli_timeout_seconds
 from .exceptions import (
     ClaudeMCPError,
     ClaudeParsingError,
@@ -152,6 +152,7 @@ class ClaudeProcessManager:
             session_id=session_id,
             continue_session=continue_session,
         )
+        timeout_seconds = max(1, resolve_cli_timeout_seconds(self.config))
 
         try:
             if cli_kind == "codex":
@@ -170,7 +171,7 @@ class ClaudeProcessManager:
                     stream_callback,
                     cli_kind=cli_kind,
                 ),
-                timeout=self.config.claude_timeout_seconds,
+                timeout=timeout_seconds,
             )
 
             logger.info(
@@ -191,12 +192,11 @@ class ClaudeProcessManager:
             logger.error(
                 "Claude Code process timed out",
                 process_id=process_id,
-                timeout_seconds=self.config.claude_timeout_seconds,
+                timeout_seconds=timeout_seconds,
             )
 
             raise ClaudeTimeoutError(
-                f"{cli_display_name} timed out after "
-                f"{self.config.claude_timeout_seconds}s"
+                f"{cli_display_name} timed out after " f"{timeout_seconds}s"
             )
 
         except Exception as e:
