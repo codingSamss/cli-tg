@@ -366,6 +366,13 @@ class ClaudeProcessManager:
             raise ClaudeProcessError(
                 "Codex image input requires local file paths in images[*].file_path."
             )
+        normalized_prompt = str(prompt or "").strip()
+        fallback_prompt = (
+            "Please analyze the attached image(s)."
+            if image_paths
+            else "Please continue where we left off"
+        )
+        effective_prompt = normalized_prompt or fallback_prompt
 
         if continue_session:
             # Use resume subcommand shape:
@@ -377,12 +384,11 @@ class ClaudeProcessManager:
                 cmd.append("--last")
             for image_path in image_paths:
                 cmd.extend(["--image", image_path])
-            cmd.append(prompt.strip() or "Please continue where we left off")
+            cmd.append(effective_prompt)
         else:
             for image_path in image_paths:
                 cmd.extend(["--image", image_path])
-            if prompt:
-                cmd.append(prompt)
+            cmd.append(effective_prompt)
 
         logger.debug("Built Codex CLI command", command=cmd)
         return cmd

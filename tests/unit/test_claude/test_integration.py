@@ -142,6 +142,61 @@ def test_build_command_for_codex_exec_includes_image_flags(tmp_path, monkeypatch
     ]
 
 
+def test_build_command_for_codex_exec_without_prompt_uses_default(tmp_path, monkeypatch):
+    """Codex exec should always include a non-empty prompt argument."""
+    manager = _build_manager(tmp_path, codex_enable_mcp=False)
+    monkeypatch.setattr(
+        "src.claude.sdk_integration.find_claude_cli",
+        lambda _: "/usr/local/bin/codex",
+    )
+
+    cmd = manager._build_command(
+        prompt="  ",
+        session_id=None,
+        continue_session=False,
+    )
+
+    assert cmd == [
+        "/usr/local/bin/codex",
+        "exec",
+        "--json",
+        "--skip-git-repo-check",
+        "-c",
+        "mcp_servers={}",
+        "Please continue where we left off",
+    ]
+
+
+def test_build_command_for_codex_exec_with_images_and_blank_prompt_uses_image_default(
+    tmp_path, monkeypatch
+):
+    """Codex image exec should synthesize fallback prompt when caption is blank."""
+    manager = _build_manager(tmp_path, codex_enable_mcp=False)
+    monkeypatch.setattr(
+        "src.claude.sdk_integration.find_claude_cli",
+        lambda _: "/usr/local/bin/codex",
+    )
+
+    cmd = manager._build_command(
+        prompt="  ",
+        session_id=None,
+        continue_session=False,
+        images=[{"file_path": "/tmp/a.png"}],
+    )
+
+    assert cmd == [
+        "/usr/local/bin/codex",
+        "exec",
+        "--json",
+        "--skip-git-repo-check",
+        "-c",
+        "mcp_servers={}",
+        "--image",
+        "/tmp/a.png",
+        "Please analyze the attached image(s).",
+    ]
+
+
 def test_build_command_for_codex_resume_uses_resume_subcommand(tmp_path, monkeypatch):
     """Codex continuation should use exec resume with session ID and prompt."""
     manager = _build_manager(tmp_path, codex_enable_mcp=False)
