@@ -1703,6 +1703,9 @@ async def _format_progress_update(update_obj: Any) -> Optional[str]:
         if metadata.get("subtype") == "turn.started":
             engine_label = _stream_engine_label(update_obj)
             return f"🤖 *{engine_label} is working...*"
+        if metadata.get("item_type") == "reasoning":
+            safe_reasoning = _escape_md(update_obj.content or "Thinking...")
+            return f"🤔 {safe_reasoning}"
         if metadata.get("item_type") == "command_execution":
             status = str(metadata.get("status") or "").strip().lower()
             command = str(metadata.get("command") or update_obj.content or "").strip()
@@ -2556,13 +2559,15 @@ async def handle_text_message(
             )
             return
 
+        initial_thinking_line = "🤔 正在处理你的请求..."
+
         # Create progress message with Cancel button
         cancel_keyboard = InlineKeyboardMarkup(
             [[InlineKeyboardButton("Cancel", callback_data="cancel:task")]]
         )
         progress_msg = await _reply_text_resilient(
             telegram_message,
-            _with_engine_badge("🤔 正在处理你的请求...", active_engine),
+            _with_engine_badge(initial_thinking_line, active_engine),
             parse_mode="Markdown",
             reply_to_message_id=input_message_id,
             reply_markup=cancel_keyboard,
@@ -2594,8 +2599,10 @@ async def handle_text_message(
         draft_id = draft_seed or 1
 
         # Enhanced stream updates handler with accumulated progress tracking
-        progress_lines: list[str] = []
-        progress_merge_keys: list[Optional[str]] = []
+        # Keep an assistant-style thinking line visible while streaming, so the
+        # bubble semantics stay consistent with 🤔 reaction status.
+        progress_lines: list[str] = [initial_thinking_line]
+        progress_merge_keys: list[Optional[str]] = [None]
         all_progress_lines = []  # 完整思考过程（不受溢出 clear 影响）
         all_progress_merge_keys: list[Optional[str]] = []
         frozen_messages = []  # 被冻结的旧进度消息
@@ -3007,6 +3014,9 @@ async def handle_text_message(
         if task_registry:
             await task_registry.remove(user_id, scope_key=scope_key)
         await _cancel_progress_flush_task()
+        if pending_progress_text:
+            await _flush_pending_progress(force=True)
+            pending_progress_text = None
 
         # Build context tag for display in thinking summary or reply header
         rate_limit_summary: Optional[str] = None
