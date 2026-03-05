@@ -45,6 +45,9 @@ _POLLING_WATCHDOG_INTERVAL_SECONDS = 2.0
 _POLLING_RECOVERY_ERROR_THRESHOLD = 3
 _DUPLICATE_UPDATE_RECOVERY_THRESHOLD = 3
 _POLLING_RESTART_COOLDOWN_SECONDS = 8.0
+_POLLING_STALL_PENDING_PROBE_INTERVAL_SECONDS = 15.0
+_POLLING_STALL_IDLE_THRESHOLD_SECONDS = 90.0
+_POLLING_STALL_PENDING_UPDATE_THRESHOLD = 1
 
 
 class ClaudeCodeBot:
@@ -63,6 +66,9 @@ class ClaudeCodeBot:
         self._last_polling_error_log: float = 0.0
         self._polling_restart_requested: bool = False
         self._last_polling_restart_monotonic: float = 0.0
+        self._last_update_activity_monotonic: float = 0.0
+        self._last_pending_probe_monotonic: float = 0.0
+        self._last_pending_update_count: int = 0
         # Update dedupe and persisted offset tracking
         self._update_dedupe_cache = UpdateDedupeCache(ttl_seconds=300, max_size=5000)
         self._update_offset_store: Optional[UpdateOffsetStore] = None
@@ -288,6 +294,7 @@ class ClaudeCodeBot:
         update_id = getattr(update, "update_id", None)
         if not isinstance(update_id, int):
             return
+        self._mark_update_activity()
 
         if (
             self._startup_min_update_id is not None
@@ -507,12 +514,25 @@ class ClaudeCodeBot:
         self._duplicate_update_id = None
         self._duplicate_update_repeat_count = 0
 
+    def _mark_update_activity(self) -> None:
+        """Mark latest local Telegram update processing activity timestamp."""
+        try:
+            now = asyncio.get_running_loop().time()
+        except RuntimeError:
+            import time
+
+            now = time.monotonic()
+        self._last_update_activity_monotonic = now
+
     async def _start_polling(self, *, drop_pending_updates: bool) -> None:
         """Start Telegram polling with shared options."""
         app = self._require_app()
         updater = getattr(app, "updater", None)
         if updater is None:
             raise ClaudeCodeTelegramError("Telegram updater is not available")
+        self._mark_update_activity()
+        self._last_pending_probe_monotonic = 0.0
+        self._last_pending_update_count = 0
 
         await updater.start_polling(
             allowed_updates=Update.ALL_TYPES,
@@ -587,6 +607,64 @@ class ClaudeCodeBot:
 
         if self._polling_restart_requested:
             await self._restart_polling(reason="network_error_threshold")
+            return
+
+        if await self._is_polling_stalled_by_pending_updates():
+            await self._restart_polling(reason="pending_updates_stall")
+
+    async def _is_polling_stalled_by_pending_updates(self) -> bool:
+        """Detect silent polling stalls via pending updates + local idle time."""
+        app = self.app
+        if app is None:
+            return False
+
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        idle_seconds = now - self._last_update_activity_monotonic
+
+        if idle_seconds < _POLLING_STALL_IDLE_THRESHOLD_SECONDS:
+            return False
+
+        if (
+            now - self._last_pending_probe_monotonic
+            < _POLLING_STALL_PENDING_PROBE_INTERVAL_SECONDS
+        ):
+            return False
+
+        self._last_pending_probe_monotonic = now
+        bot = getattr(app, "bot", None)
+        if bot is None:
+            return False
+
+        try:
+            webhook_info = await bot.get_webhook_info()
+        except Exception as exc:
+            logger.debug(
+                "Pending-update stall probe failed",
+                error=str(exc),
+                idle_seconds=round(idle_seconds, 2),
+            )
+            return False
+
+        raw_pending = getattr(webhook_info, "pending_update_count", 0)
+        try:
+            pending_count = int(raw_pending)
+        except (TypeError, ValueError):
+            pending_count = 0
+        if pending_count < 0:
+            pending_count = 0
+        self._last_pending_update_count = pending_count
+
+        if pending_count < _POLLING_STALL_PENDING_UPDATE_THRESHOLD:
+            return False
+
+        logger.warning(
+            "Polling stall suspected from pending updates backlog",
+            pending_update_count=pending_count,
+            idle_seconds=round(idle_seconds, 2),
+            idle_threshold_seconds=_POLLING_STALL_IDLE_THRESHOLD_SECONDS,
+        )
+        return True
 
     async def start(self) -> None:
         """Start the bot."""
