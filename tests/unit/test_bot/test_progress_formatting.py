@@ -160,20 +160,6 @@ async def test_progress_command_execution_renders_compact_running_line():
 
 
 @pytest.mark.asyncio
-async def test_progress_reasoning_renders_assistant_style_line():
-    """Reasoning progress should render as assistant-thinking style narration."""
-    update = _FakeUpdate(
-        type="progress",
-        content="Checking official pricing docs",
-        metadata={"item_type": "reasoning", "engine": "codex"},
-    )
-
-    text = await _format_progress_update(update)
-
-    assert text == "🤔 Checking official pricing docs"
-
-
-@pytest.mark.asyncio
 async def test_progress_command_execution_renders_completion_exit_code():
     """Completed command update should include exit code in rendered line."""
     update = _FakeUpdate(
@@ -250,94 +236,6 @@ async def test_handle_text_message_fallback_does_not_crash_when_progress_init_fa
 
     assert reply_calls["count"] >= 2
     set_reaction.assert_awaited()
-
-
-@pytest.mark.asyncio
-async def test_handle_text_message_flushes_pending_progress_before_finalize(
-    tmp_path, monkeypatch
-):
-    """Fast completion should still flush pending thinking line before collapse."""
-    approved = tmp_path / "approved"
-    approved.mkdir()
-
-    message = SimpleNamespace(
-        text="quick check",
-        message_id=31,
-        message_thread_id=None,
-        chat=SimpleNamespace(send_action=AsyncMock()),
-    )
-    update = SimpleNamespace(
-        effective_user=SimpleNamespace(id=10031),
-        message=message,
-        effective_chat=SimpleNamespace(id=-10031, type="supergroup"),
-        effective_message=message,
-    )
-    context = SimpleNamespace(
-        bot_data={
-            "settings": SimpleNamespace(
-                approved_directory=approved,
-                stream_render_debounce_ms=200,
-                stream_render_min_edit_interval_ms=0,
-                status_reactions_enabled=False,
-            )
-        },
-        user_data={},
-        bot=SimpleNamespace(),
-    )
-
-    progress_msg = SimpleNamespace(
-        message_id=90031,
-        edit_text=AsyncMock(),
-        edit_reply_markup=AsyncMock(),
-        delete=AsyncMock(),
-    )
-
-    async def _fake_reply(_message, _text, *args, **kwargs):
-        if _fake_reply.calls == 0:
-            _fake_reply.calls += 1
-            return progress_msg
-        _fake_reply.calls += 1
-        return SimpleNamespace(
-            message_id=90031 + _fake_reply.calls,
-            edit_text=AsyncMock(),
-            edit_reply_markup=AsyncMock(),
-            delete=AsyncMock(),
-        )
-
-    _fake_reply.calls = 0
-
-    async def _fake_run_command(**kwargs):
-        on_stream = kwargs.get("on_stream")
-        if on_stream:
-            await on_stream(
-                _FakeUpdate(
-                    type="progress",
-                    content="assistant streaming line",
-                    metadata={"engine": "codex"},
-                )
-            )
-        return SimpleNamespace(
-            content="final answer",
-            session_id="sid-fast-31",
-            cost=0.0,
-            duration_ms=1,
-            num_turns=1,
-            is_error=False,
-            error_type=None,
-            tools_used=[],
-            model_usage={},
-        )
-
-    monkeypatch.setattr(
-        "src.bot.handlers.message.get_cli_integration",
-        lambda **_: (ENGINE_CODEX, SimpleNamespace(run_command=_fake_run_command)),
-    )
-    monkeypatch.setattr("src.bot.handlers.message._reply_text_resilient", _fake_reply)
-
-    await handle_text_message(update, context)
-
-    edited_texts = [str(call.args[0]) for call in progress_msg.edit_text.await_args_list]
-    assert any("assistant streaming line" in text for text in edited_texts)
 
 
 @pytest.mark.asyncio

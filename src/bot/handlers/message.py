@@ -1703,9 +1703,6 @@ async def _format_progress_update(update_obj: Any) -> Optional[str]:
         if metadata.get("subtype") == "turn.started":
             engine_label = _stream_engine_label(update_obj)
             return f"🤖 *{engine_label} is working...*"
-        if metadata.get("item_type") == "reasoning":
-            safe_reasoning = _escape_md(update_obj.content or "Thinking...")
-            return f"🤔 {safe_reasoning}"
         if metadata.get("item_type") == "command_execution":
             status = str(metadata.get("status") or "").strip().lower()
             command = str(metadata.get("command") or update_obj.content or "").strip()
@@ -3014,9 +3011,6 @@ async def handle_text_message(
         if task_registry:
             await task_registry.remove(user_id, scope_key=scope_key)
         await _cancel_progress_flush_task()
-        if pending_progress_text:
-            await _flush_pending_progress(force=True)
-            pending_progress_text = None
 
         # Build context tag for display in thinking summary or reply header
         rate_limit_summary: Optional[str] = None
