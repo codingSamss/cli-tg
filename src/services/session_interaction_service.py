@@ -345,16 +345,6 @@ def _render_model_usage_lines(model_usage: dict | None) -> list[str]:
 class SessionInteractionService:
     """Provide reusable continue/export interaction texts and keyboard specs."""
 
-    _NEW_SESSION_KEYBOARD: KeyboardSpec = [
-        [
-            ("📝 Start Coding", "action:start_coding"),
-            ("📁 Change Project", "action:show_projects"),
-        ],
-        [
-            ("📋 Quick Actions", "action:quick_actions"),
-            ("❓ Help", "action:help"),
-        ],
-    ]
     _END_NO_ACTIVE_CALLBACK_KEYBOARD: KeyboardSpec = [
         [("🆕 New Session", "action:new_session")],
         [("📊 Context", "action:context")],
@@ -624,7 +614,7 @@ class SessionInteractionService:
             text = (
                 f"🆕 **{title}**\n\n"
                 f"📂 Working directory: `{relative_path}`\n\n"
-                "Ready to help you code! Send me a message to get started:"
+                "Ready to help you code! Send me a message to get started."
             )
         else:
             cleared_info = ""
@@ -635,10 +625,9 @@ class SessionInteractionService:
             text = (
                 f"🆕 **{title}**\n\n"
                 f"📂 Working directory: `{relative_path}`{cleared_info}\n\n"
-                "Context has been cleared. Send a message to start fresh, "
-                "or use the buttons below:"
+                "Context has been cleared. Send a message to start fresh."
             )
-        return SessionInteractionMessage(text=text, keyboard=self._NEW_SESSION_KEYBOARD)
+        return SessionInteractionMessage(text=text)
 
     def build_end_no_active_message(
         self,

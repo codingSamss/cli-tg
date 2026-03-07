@@ -52,8 +52,7 @@ def test_build_new_session_message_for_command_with_previous_session():
     assert "New AI Session" in message.text
     assert "project/" in message.text
     assert "Previous session `session-...` cleared" in message.text
-    assert message.keyboard is not None
-    assert message.keyboard[0][0][1] == "action:start_coding"
+    assert message.keyboard is None
 
 
 def test_build_new_session_message_for_callback():
@@ -68,8 +67,7 @@ def test_build_new_session_message_for_callback():
     )
 
     assert "Ready to help you code!" in message.text
-    assert message.keyboard is not None
-    assert message.keyboard[1][0][1] == "action:quick_actions"
+    assert message.keyboard is None
 
 
 def test_build_new_session_message_uses_active_engine_title():
