@@ -28,11 +28,15 @@ async def test_restart_polling_stops_then_starts_updater() -> None:
         stop=AsyncMock(),
         start_polling=AsyncMock(),
     )
+    telegram_bot = SimpleNamespace(
+        shutdown=AsyncMock(),
+        initialize=AsyncMock(),
+    )
     bot = ClaudeCodeBot(
         settings=SimpleNamespace(webhook_url=None),
         dependencies={},
     )
-    bot.app = SimpleNamespace(updater=updater)
+    bot.app = SimpleNamespace(updater=updater, bot=telegram_bot)
     bot._polling_restart_requested = True
     bot._polling_error_count = 9
     bot._duplicate_update_id = 123
@@ -50,9 +54,40 @@ async def test_restart_polling_stops_then_starts_updater() -> None:
     assert kwargs["error_callback"] == bot._polling_error_callback
     assert bot._polling_restart_requested is False
     assert bot._polling_error_count == 0
+    telegram_bot.shutdown.assert_awaited_once()
+    telegram_bot.initialize.assert_awaited_once()
     bot._update_dedupe_cache.clear.assert_called_once()
     assert bot._duplicate_update_id is None
     assert bot._duplicate_update_repeat_count == 0
+
+
+@pytest.mark.asyncio
+async def test_restart_polling_continues_when_transport_refresh_fails() -> None:
+    """Transport refresh errors should not block polling restart."""
+    updater = SimpleNamespace(
+        running=True,
+        stop=AsyncMock(),
+        start_polling=AsyncMock(),
+    )
+    telegram_bot = SimpleNamespace(
+        shutdown=AsyncMock(side_effect=RuntimeError("refresh failed")),
+        initialize=AsyncMock(),
+    )
+    bot = ClaudeCodeBot(
+        settings=SimpleNamespace(webhook_url=None),
+        dependencies={},
+    )
+    bot.app = SimpleNamespace(updater=updater, bot=telegram_bot)
+    bot._update_dedupe_cache = SimpleNamespace(clear=Mock())
+
+    restarted = await bot._restart_polling(reason="refresh_failure")
+
+    assert restarted is True
+    updater.stop.assert_awaited_once()
+    updater.start_polling.assert_awaited_once()
+    telegram_bot.shutdown.assert_awaited_once()
+    telegram_bot.initialize.assert_not_awaited()
+    bot._update_dedupe_cache.clear.assert_called_once()
 
 
 @pytest.mark.asyncio

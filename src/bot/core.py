@@ -48,6 +48,7 @@ _POLLING_RESTART_COOLDOWN_SECONDS = 8.0
 _POLLING_STALL_PENDING_PROBE_INTERVAL_SECONDS = 15.0
 _POLLING_STALL_IDLE_THRESHOLD_SECONDS = 90.0
 _POLLING_STALL_PENDING_UPDATE_THRESHOLD = 1
+_POLLING_GET_UPDATES_CONNECTION_POOL_SIZE = 4
 
 
 class ClaudeCodeBot:
@@ -95,6 +96,11 @@ class ClaudeCodeBot:
         builder.read_timeout(30)
         builder.write_timeout(30)
         builder.pool_timeout(30)
+        # Keep a slightly larger pool for getUpdates so polling restart/cleanup
+        # can progress even if one long-poll connection is still draining.
+        builder.get_updates_connection_pool_size(
+            _POLLING_GET_UPDATES_CONNECTION_POOL_SIZE
+        )
 
         # Enable concurrent update processing so that permission button
         # callbacks can be handled while a Claude request is waiting for
@@ -569,6 +575,7 @@ class ClaudeCodeBot:
         try:
             if updater.running:
                 await updater.stop()
+            await self._refresh_polling_transport_clients(reason=reason)
 
             # Clear in-memory dedupe state so a previously stuck update can be retried
             # after the polling transport is restarted.
@@ -591,6 +598,31 @@ class ClaudeCodeBot:
         self._reset_polling_recovery_state()
         logger.info("Polling self-recovery succeeded", reason=reason)
         return True
+
+    async def _refresh_polling_transport_clients(self, *, reason: str) -> None:
+        """Best-effort refresh of Telegram HTTP clients before polling restart."""
+        app = self.app
+        if app is None:
+            return
+        bot = getattr(app, "bot", None)
+        if bot is None:
+            return
+
+        shutdown = getattr(bot, "shutdown", None)
+        initialize = getattr(bot, "initialize", None)
+        if not callable(shutdown) or not callable(initialize):
+            return
+
+        try:
+            await shutdown()
+            await initialize()
+        except Exception as exc:
+            logger.warning(
+                "Failed to refresh polling transport clients",
+                reason=reason,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
 
     async def _polling_watchdog_tick(self) -> None:
         """Watch polling status and trigger self-recovery when needed."""
