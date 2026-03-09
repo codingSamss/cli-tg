@@ -138,6 +138,7 @@ def test_build_command_for_codex_exec_includes_image_flags(tmp_path, monkeypatch
         "/tmp/a.png",
         "--image",
         "/tmp/b.jpg",
+        "--",
         "分析这张图",
     ]
 
@@ -163,6 +164,7 @@ def test_build_command_for_codex_exec_without_prompt_uses_default(tmp_path, monk
         "--skip-git-repo-check",
         "-c",
         "mcp_servers={}",
+        "--",
         "Please continue where we left off",
     ]
 
@@ -193,6 +195,38 @@ def test_build_command_for_codex_exec_with_images_and_blank_prompt_uses_image_de
         "mcp_servers={}",
         "--image",
         "/tmp/a.png",
+        "--",
+        "Please analyze the attached image(s).",
+    ]
+
+
+def test_build_command_for_codex_exec_with_dash_prompt_uses_safe_fallback(
+    tmp_path, monkeypatch
+):
+    """Codex should not treat literal '-' prompt as stdin marker in bot flow."""
+    manager = _build_manager(tmp_path, codex_enable_mcp=False)
+    monkeypatch.setattr(
+        "src.claude.sdk_integration.find_claude_cli",
+        lambda _: "/usr/local/bin/codex",
+    )
+
+    cmd = manager._build_command(
+        prompt="-",
+        session_id=None,
+        continue_session=False,
+        images=[{"file_path": "/tmp/a.png"}],
+    )
+
+    assert cmd == [
+        "/usr/local/bin/codex",
+        "exec",
+        "--json",
+        "--skip-git-repo-check",
+        "-c",
+        "mcp_servers={}",
+        "--image",
+        "/tmp/a.png",
+        "--",
         "Please analyze the attached image(s).",
     ]
 
@@ -223,6 +257,7 @@ def test_build_command_for_codex_resume_uses_resume_subcommand(tmp_path, monkeyp
         "gpt-5",
         "resume",
         "thread-123",
+        "--",
         "继续",
     ]
 
@@ -255,6 +290,7 @@ def test_build_command_for_codex_resume_with_images_places_flags_after_resume(
         "thread-123",
         "--image",
         "/tmp/a.png",
+        "--",
         "请结合这张图继续分析",
     ]
 
@@ -284,6 +320,7 @@ def test_build_command_for_codex_resume_without_prompt_uses_default(
         "mcp_servers={}",
         "resume",
         "thread-123",
+        "--",
         "Please continue where we left off",
     ]
 

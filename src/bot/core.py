@@ -194,6 +194,7 @@ class ClaudeCodeBot:
             ("cancel", command.cancel_task),
             ("queue", command.queue_status_command),
             ("dequeue", command.dequeue_command),
+            ("sendpic", command.send_picture_command),
             ("resume", command.resume_command),
             ("model", command.model_command),
             ("codexdiag", command.codex_diag_command),

@@ -24,7 +24,6 @@ from src.bot.handlers.command import (
 )
 from src.bot.resume_tokens import ResumeTokenManager
 from src.bot.utils.cli_engine import ENGINE_CODEX, ENGINE_STATE_KEY, get_cli_integration
-from src.services.session_service import SessionService
 
 
 def _scope_key(user_id: int, chat_id: int) -> str:
@@ -430,10 +429,8 @@ async def test_model_command_codex_can_set_and_reset_model(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_model_command_codex_formats_reasoning_effort_from_snapshot(
-    tmp_path, monkeypatch
-):
-    """Codex /model should render normalized reasoning effort from local snapshot."""
+async def test_model_command_codex_without_explicit_model_shows_default(tmp_path):
+    """Codex /model should show default when user has not selected a model."""
     approved = tmp_path / "approved"
     approved.mkdir()
     user_id = 10041
@@ -456,18 +453,10 @@ async def test_model_command_codex_formats_reasoning_effort_from_snapshot(
             }
         },
     )
-    monkeypatch.setattr(
-        SessionService,
-        "get_cached_codex_snapshot",
-        classmethod(
-            lambda cls, _sid: {"resolved_model": "gpt-5", "reasoning_effort": "xhigh"}
-        ),
-    )
-
     await model_command(update, context)
 
     rendered = update.message.reply_text.await_args.args[0]
-    assert "当前模型：`gpt-5 (X High)`" in rendered
+    assert "当前模型：`default`" in rendered
 
 
 @pytest.mark.asyncio

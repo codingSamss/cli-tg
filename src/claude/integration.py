@@ -367,12 +367,17 @@ class ClaudeProcessManager:
                 "Codex image input requires local file paths in images[*].file_path."
             )
         normalized_prompt = str(prompt or "").strip()
+        # Codex treats "-" as "read prompt from stdin"; avoid accidental empty-stdin failures.
+        if normalized_prompt == "-":
+            normalized_prompt = ""
         fallback_prompt = (
             "Please analyze the attached image(s)."
             if image_paths
             else "Please continue where we left off"
         )
         effective_prompt = normalized_prompt or fallback_prompt
+        if effective_prompt == "-":
+            effective_prompt = fallback_prompt
 
         if continue_session:
             # Use resume subcommand shape:
@@ -384,10 +389,12 @@ class ClaudeProcessManager:
                 cmd.append("--last")
             for image_path in image_paths:
                 cmd.extend(["--image", image_path])
+            cmd.append("--")
             cmd.append(effective_prompt)
         else:
             for image_path in image_paths:
                 cmd.extend(["--image", image_path])
+            cmd.append("--")
             cmd.append(effective_prompt)
 
         logger.debug("Built Codex CLI command", command=cmd)

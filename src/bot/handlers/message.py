@@ -21,8 +21,6 @@ from ...claude.task_registry import TaskRegistry
 from ...config.settings import Settings
 from ...security.audit import AuditLogger
 from ...security.validators import SecurityValidator
-from ...services.session_service import SessionService
-from ...utils.codex_rate_limits import format_rate_limit_summary
 from ..inbound_task_queue import InboundTaskQueue
 from ..utils.cli_engine import (
     ENGINE_CLAUDE,
@@ -3013,28 +3011,12 @@ async def handle_text_message(
         await _cancel_progress_flush_task()
 
         # Build context tag for display in thinking summary or reply header
-        rate_limit_summary: Optional[str] = None
-        session_context_summary: Optional[str] = None
-        session_id = claude_response.session_id if claude_response else None
         codex_snapshot = None
-        if active_engine == ENGINE_CODEX and session_id:
-            codex_snapshot = SessionService.get_cached_codex_snapshot(session_id)
-            if codex_snapshot is None:
-                codex_snapshot = SessionService._probe_codex_session_snapshot(
-                    session_id
-                )
-        if codex_snapshot:
-            session_context_summary = _build_session_context_summary(codex_snapshot)
-            rate_limit_summary = format_rate_limit_summary(
-                codex_snapshot.get("rate_limits")
-            )
         context_tag = _build_context_tag(
             scope_state=scope_state,
             approved_directory=settings.approved_directory,
             active_engine=active_engine,
             session_id=scope_state.get("claude_session_id"),
-            session_context_summary=session_context_summary,
-            rate_limit_summary=rate_limit_summary,
         )
         collapsed_fallback_model = _resolve_collapsed_fallback_model(
             active_engine=active_engine,
@@ -4210,32 +4192,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
                 # Build context tag for image response
                 img_codex_snapshot = None
-                img_rate_limit_summary: Optional[str] = None
-                img_session_context_summary: Optional[str] = None
-                if active_engine == ENGINE_CODEX:
-                    img_sid = str(scope_state.get("claude_session_id") or "").strip()
-                    if img_sid:
-                        img_codex_snapshot = SessionService.get_cached_codex_snapshot(
-                            img_sid
-                        )
-                        if img_codex_snapshot is None:
-                            img_codex_snapshot = (
-                                SessionService._probe_codex_session_snapshot(img_sid)
-                            )
-                if img_codex_snapshot:
-                    img_session_context_summary = _build_session_context_summary(
-                        img_codex_snapshot
-                    )
-                    img_rate_limit_summary = format_rate_limit_summary(
-                        img_codex_snapshot.get("rate_limits")
-                    )
                 img_context_tag = _build_context_tag(
                     scope_state=scope_state,
                     approved_directory=settings.approved_directory,
                     active_engine=active_engine,
                     session_id=scope_state.get("claude_session_id"),
-                    session_context_summary=img_session_context_summary,
-                    rate_limit_summary=img_rate_limit_summary,
                 )
                 img_fallback_model = _resolve_collapsed_fallback_model(
                     active_engine=active_engine,

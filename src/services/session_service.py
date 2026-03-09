@@ -530,36 +530,30 @@ class SessionService:
         if session_id:
             lines.append(f"Session: `{session_id[:8]}...`")
             if claude_integration:
-                codex_local_snapshot: Optional[Dict[str, Any]] = None
-                if cli_kind == "codex":
-                    codex_local_snapshot = SessionService._probe_codex_session_snapshot(
-                        session_id
-                    )
-                    if (
-                        codex_local_snapshot
-                        and codex_local_snapshot.get("used_tokens") is not None
-                        and codex_local_snapshot.get("total_tokens") is not None
-                    ):
-                        precise_context = dict(codex_local_snapshot)
-
-                if allow_precise_context_probe and not precise_context:
-                    precise_context = (
-                        await claude_integration.get_precise_context_usage(
-                            session_id=session_id,
-                            working_directory=current_dir,
-                            model=current_model,
+                if allow_precise_context_probe:
+                    probe_kwargs: Dict[str, Any] = {
+                        "session_id": session_id,
+                        "working_directory": current_dir,
+                        "model": current_model,
+                    }
+                    # Codex status requires live probe for strict consistency.
+                    if cli_kind == "codex":
+                        probe_kwargs["force_refresh"] = True
+                    try:
+                        precise_context = (
+                            await claude_integration.get_precise_context_usage(
+                                **probe_kwargs
+                            )
                         )
-                    )
-                if (
-                    cli_kind == "codex"
-                    and isinstance(precise_context, dict)
-                    and codex_local_snapshot
-                    and codex_local_snapshot.get("reasoning_effort")
-                    and not precise_context.get("reasoning_effort")
-                ):
-                    precise_context["reasoning_effort"] = codex_local_snapshot[
-                        "reasoning_effort"
-                    ]
+                    except TypeError:
+                        # Backward compatibility: older integration may not accept
+                        # force_refresh keyword argument.
+                        probe_kwargs.pop("force_refresh", None)
+                        precise_context = (
+                            await claude_integration.get_precise_context_usage(
+                                **probe_kwargs
+                            )
+                        )
                 if precise_context:
                     lines.extend(build_precise_context_status_lines(precise_context))
 
@@ -577,17 +571,12 @@ class SessionService:
 
                     model_usage = session_info.get("model_usage")
                     if model_usage and not precise_context:
-                        if (
-                            cli_kind == "codex"
-                            and not SessionService._usage_has_context_window(
-                                model_usage
-                            )
-                        ):
+                        if cli_kind == "codex":
                             lines.extend(
                                 [
                                     "",
                                     "*Context (/status)*",
-                                    "实时上下文占用不可用。请执行 `/status` 刷新。",
+                                    "实时额度获取失败。请稍后重试或手动执行 `/status`。",
                                 ]
                             )
                         else:
@@ -598,19 +587,14 @@ class SessionService:
                                     allow_estimated_ratio=True,
                                 )
                             )
-
-                    if (
-                        cli_kind == "codex"
-                        and precise_context is None
-                        and codex_local_snapshot
-                        and codex_local_snapshot.get("resolved_model")
-                    ):
-                        precise_context = {
-                            "resolved_model": codex_local_snapshot["resolved_model"]
-                        }
-                        effort = codex_local_snapshot.get("reasoning_effort")
-                        if effort:
-                            precise_context["reasoning_effort"] = effort
+                    if cli_kind == "codex" and not precise_context and not model_usage:
+                        lines.extend(
+                            [
+                                "",
+                                "*Context (/status)*",
+                                "实时额度获取失败。请稍后重试或手动执行 `/status`。",
+                            ]
+                        )
 
                     model_display = SessionService._resolve_display_model(
                         current_model=current_model,

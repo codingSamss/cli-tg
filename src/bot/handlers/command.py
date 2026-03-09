@@ -4,6 +4,7 @@ import asyncio
 import sys
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import structlog
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -33,6 +34,7 @@ from ..utils.recent_projects import build_recent_projects_message, scan_recent_p
 from ..utils.resume_ui import build_resume_project_selector
 from ..utils.scope_state import get_scope_state_from_update
 from ..utils.telegram_send import (
+    is_thread_not_found_error,
     is_markdown_parse_error,
     normalize_message_thread_id,
     prepare_telegram_text_and_parse_mode,
@@ -44,6 +46,7 @@ from .message import build_permission_handler
 logger = structlog.get_logger()
 _PARSE_MODE_UNSET = object()
 _CHAT_ACTION_HEARTBEAT_INTERVAL_SECONDS = 4.0
+_SENDPIC_ALLOWED_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 
 
 def _require_effective_user(update: Update) -> Any:
@@ -258,6 +261,148 @@ async def _send_chat_action_heartbeat(
             await asyncio.wait_for(stop_event.wait(), timeout=wait_timeout)
         except asyncio.TimeoutError:
             continue
+
+
+def _is_http_photo_source(raw_source: str) -> bool:
+    """Whether source is an http/https URL."""
+    parsed = urlparse(str(raw_source or "").strip())
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _resolve_sendpic_local_path(
+    *,
+    source: str,
+    current_directory: Path,
+    approved_directory: Path,
+    security_validator: Optional[SecurityValidator],
+) -> tuple[Optional[Path], Optional[str]]:
+    """Resolve and validate local image path for /sendpic."""
+    normalized_source = str(source or "").strip()
+    if not normalized_source:
+        return None, "图片路径不能为空。"
+
+    resolved_path: Optional[Path] = None
+    if security_validator:
+        valid, candidate_path, error = security_validator.validate_path(
+            normalized_source, current_directory
+        )
+        if not valid or candidate_path is None:
+            return None, error or "图片路径不合法。"
+        resolved_path = candidate_path
+    else:
+        candidate = Path(normalized_source).expanduser()
+        if not candidate.is_absolute():
+            candidate = (current_directory / candidate).resolve()
+        else:
+            candidate = candidate.resolve()
+        try:
+            candidate.relative_to(approved_directory.resolve())
+        except ValueError:
+            return None, "Access denied: path outside approved directory"
+        resolved_path = candidate
+
+    if resolved_path is None:
+        return None, "无法解析图片路径。"
+
+    if not resolved_path.exists() or not resolved_path.is_file():
+        return None, f"图片文件不存在：`{resolved_path}`"
+
+    suffix = resolved_path.suffix.lower()
+    if suffix not in _SENDPIC_ALLOWED_SUFFIXES:
+        allowed = ", ".join(sorted(_SENDPIC_ALLOWED_SUFFIXES))
+        return None, f"仅支持图片扩展名：{allowed}"
+
+    return resolved_path, None
+
+
+def _find_latest_sendpic_image(
+    *,
+    current_directory: Path,
+    approved_directory: Path,
+) -> Optional[Path]:
+    """Find latest image under current workspace (and .claude-images if present)."""
+    approved_root = approved_directory.resolve()
+    candidate_roots: list[Path] = [
+        current_directory.resolve(),
+        approved_root / ".claude-images",
+    ]
+
+    best_path: Optional[Path] = None
+    best_mtime: float = -1.0
+    scanned_roots: set[str] = set()
+
+    for root in candidate_roots:
+        root_key = str(root)
+        if root_key in scanned_roots:
+            continue
+        scanned_roots.add(root_key)
+
+        if not root.exists() or not root.is_dir():
+            continue
+        if not root.is_relative_to(approved_root):
+            continue
+
+        for image_path in root.rglob("*"):
+            if not image_path.is_file():
+                continue
+            if image_path.suffix.lower() not in _SENDPIC_ALLOWED_SUFFIXES:
+                continue
+            try:
+                stat = image_path.stat()
+            except OSError:
+                continue
+            if stat.st_mtime > best_mtime:
+                best_mtime = stat.st_mtime
+                best_path = image_path
+
+    return best_path
+
+
+async def _send_photo_resilient(
+    *,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    photo: Any,
+    caption: Optional[str] = None,
+    filename: Optional[str] = None,
+) -> Any:
+    """Send photo with forum-thread fallback."""
+    chat = _require_effective_chat(update)
+    chat_id = chat.id
+    bot = getattr(context, "bot", None)
+    if bot is None:
+        raise RuntimeError("Telegram bot instance is unavailable")
+
+    chat_type = getattr(chat, "type", None)
+    should_quote_reply = str(chat_type or "").strip().lower() != "private"
+    reply_to_message_id = getattr(getattr(update, "message", None), "message_id", None)
+    normalized_thread_id = normalize_message_thread_id(
+        getattr(update.effective_message, "message_thread_id", None),
+        chat_type=chat_type,
+    )
+
+    send_kwargs: dict[str, Any] = {"chat_id": chat_id, "photo": photo}
+    if caption:
+        send_kwargs["caption"] = caption
+    if filename:
+        send_kwargs["filename"] = filename
+    if (
+        should_quote_reply
+        and isinstance(reply_to_message_id, int)
+        and reply_to_message_id > 0
+    ):
+        send_kwargs["reply_to_message_id"] = reply_to_message_id
+    if normalized_thread_id is not None:
+        send_kwargs["message_thread_id"] = normalized_thread_id
+
+    try:
+        return await bot.send_photo(**send_kwargs)
+    except Exception as send_error:
+        if "message_thread_id" in send_kwargs and is_thread_not_found_error(send_error):
+            retry_kwargs = dict(send_kwargs)
+            retry_kwargs.pop("message_thread_id", None)
+            return await bot.send_photo(**retry_kwargs)
+        raise
 
 
 def _get_or_create_resume_token_manager(context: ContextTypes.DEFAULT_TYPE) -> Any:
@@ -503,6 +648,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"• `/cancel` - Cancel current running task\n"
         f"• `/queue` - Show queued tasks\n"
         f"• `/dequeue <id>` - Remove one queued task\n"
+        f"• `/sendpic [path|url] [caption]` - Send latest/specified image\n"
         f"• `/git` - Git repository commands\n"
         f"{diagnostics_line}\n"
         f"**Quick Start:**\n"
@@ -592,6 +738,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• `/cancel` - Cancel current running task\n"
         "• `/queue` - Show queued tasks\n"
         "• `/dequeue <id>` - Remove one queued task\n"
+        "• `/sendpic [path|url] [caption]` - Send latest/specified image\n"
         f"{model_line}"
         "• `/export` - Export session history\n"
         "• `/git` - Git repository information\n\n"
@@ -625,6 +772,130 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await _reply_update_message_resilient(
         update, context, help_text, parse_mode="Markdown"
     )
+
+
+async def send_picture_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handle /sendpic command to send image by local path or URL."""
+    user_id = _require_effective_user(update).id
+    settings: Settings = context.bot_data["settings"]
+    _, scope_state = get_scope_state_from_update(
+        user_data=context.user_data,
+        update=update,
+        default_directory=settings.approved_directory,
+    )
+    security_validator: Optional[SecurityValidator] = context.bot_data.get(
+        "security_validator"
+    )
+    audit_logger: Optional[AuditLogger] = context.bot_data.get("audit_logger")
+
+    current_dir_raw = scope_state.get("current_directory", settings.approved_directory)
+    current_directory = (
+        Path(current_dir_raw)
+        if isinstance(current_dir_raw, (str, Path))
+        else settings.approved_directory
+    )
+    args = [str(arg).strip() for arg in (context.args or []) if str(arg).strip()]
+    source = args[0] if args else ""
+    caption = " ".join(args[1:]).strip() if len(args) > 1 else ""
+    normalized_caption = caption or None
+
+    try:
+        if not args:
+            latest_image = _find_latest_sendpic_image(
+                current_directory=current_directory,
+                approved_directory=settings.approved_directory,
+            )
+            if latest_image is None:
+                await _reply_update_message_resilient(
+                    update,
+                    context,
+                    "**用法：** `/sendpic [path_or_url] [caption]`\n\n"
+                    "无参数时会自动发送最近一张图片。\n"
+                    "未找到可发送图片时，可显式指定路径或 URL。\n\n"
+                    "**示例：**\n"
+                    "• `/sendpic`（自动发送最近图片）\n"
+                    "• `/sendpic assets/logo.png`\n"
+                    "• `/sendpic https://example.com/demo.jpg Demo image`",
+                    parse_mode="Markdown",
+                )
+                return
+
+            with latest_image.open("rb") as image_file:
+                await _send_photo_resilient(
+                    update=update,
+                    context=context,
+                    photo=image_file,
+                    caption=normalized_caption,
+                    filename=latest_image.name,
+                )
+        elif _is_http_photo_source(source):
+            await _send_photo_resilient(
+                update=update,
+                context=context,
+                photo=source,
+                caption=normalized_caption,
+            )
+        else:
+            resolved_path, path_error = _resolve_sendpic_local_path(
+                source=source,
+                current_directory=current_directory,
+                approved_directory=settings.approved_directory,
+                security_validator=security_validator,
+            )
+            if resolved_path is None:
+                await _reply_update_message_resilient(
+                    update,
+                    context,
+                    f"❌ **发送失败**\n\n{path_error or '无效图片路径。'}",
+                    parse_mode="Markdown",
+                )
+                if audit_logger:
+                    await audit_logger.log_command(
+                        user_id=user_id,
+                        command="sendpic",
+                        args=context.args or [],
+                        success=False,
+                    )
+                return
+
+            with resolved_path.open("rb") as image_file:
+                await _send_photo_resilient(
+                    update=update,
+                    context=context,
+                    photo=image_file,
+                    caption=normalized_caption,
+                    filename=resolved_path.name,
+                )
+
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=user_id,
+                command="sendpic",
+                args=context.args or [],
+                success=True,
+            )
+    except Exception as error:
+        logger.error(
+            "sendpic command failed",
+            user_id=user_id,
+            source=source,
+            error=str(error),
+        )
+        await _reply_update_message_resilient(
+            update,
+            context,
+            "❌ **发送图片失败**\n\n" "请检查路径/URL是否可访问，或稍后重试。",
+            parse_mode="Markdown",
+        )
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=user_id,
+                command="sendpic",
+                args=context.args or [],
+                success=False,
+            )
 
 
 async def switch_engine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2219,26 +2490,9 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     active_engine = get_active_cli_engine(scope_state)
     capabilities = get_engine_capabilities(active_engine)
     if active_engine == ENGINE_CODEX:
-        session_id = str(scope_state.get("claude_session_id") or "").strip()
-        codex_snapshot: dict | None = None
-        if session_id:
-            codex_snapshot = SessionService.get_cached_codex_snapshot(session_id)
-            if codex_snapshot is None:
-                codex_snapshot = SessionService._probe_codex_session_snapshot(
-                    session_id
-                )
-
         current_model = str(scope_state.get("claude_model") or "").strip()
         resolved_model = ""
-        reasoning_effort = ""
-        if isinstance(codex_snapshot, dict):
-            resolved_model = str(codex_snapshot.get("resolved_model") or "").strip()
-            reasoning_effort = str(codex_snapshot.get("reasoning_effort") or "").strip()
-
-        model_display = (resolved_model or current_model or "default").replace("`", "")
-        if reasoning_effort and model_display.lower() not in {"default", "current"}:
-            effort_display = _normalize_reasoning_effort_label(reasoning_effort)
-            model_display = f"{model_display} ({effort_display})"
+        model_display = (current_model or "default").replace("`", "")
 
         requested_model = " ".join(context.args or []).strip()
         if requested_model:

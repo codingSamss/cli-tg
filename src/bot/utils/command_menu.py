@@ -32,6 +32,7 @@ COMMAND_MENU_SPECS: tuple[MenuCommandSpec, ...] = (
     MenuCommandSpec("projects", "Show all projects"),
     MenuCommandSpec("cd", "Change directory (resumes project session)"),
     MenuCommandSpec("ls", "List files in current directory"),
+    MenuCommandSpec("sendpic", "Send image by path or URL"),
     MenuCommandSpec("git", "Git repository commands"),
     MenuCommandSpec("export", "Export current session"),
     MenuCommandSpec("provider", "Switch API provider (cc-switch)"),

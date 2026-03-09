@@ -11,7 +11,6 @@ from src.bot.handlers import message as message_handler
 from src.bot.handlers.message import _integration_supports_image_analysis, handle_photo
 from src.bot.utils.cli_engine import ENGINE_STATE_KEY
 from src.config.settings import Settings
-from src.services.session_service import SessionService
 
 
 def _scope_key(user_id: int) -> str:
@@ -161,9 +160,7 @@ async def test_photo_upload_reports_sdk_required_when_no_engine_supports_images(
 
 
 @pytest.mark.asyncio
-async def test_photo_upload_codex_passes_cli_image_file_and_cleans_up(
-    tmp_path, monkeypatch
-):
+async def test_photo_upload_codex_passes_cli_image_file_and_cleans_up(tmp_path):
     """Codex image flow should attach local file path and cleanup temp file."""
     approved = tmp_path / "approved"
     approved.mkdir()
@@ -267,23 +264,6 @@ async def test_photo_upload_codex_passes_cli_image_file_and_cleans_up(
             }
         },
     )
-    monkeypatch.setattr(
-        SessionService,
-        "get_cached_codex_snapshot",
-        classmethod(
-            lambda cls, _sid: {
-                "resolved_model": "gpt-5.3-codex",
-                "used_percent": 28.2,
-                "total_tokens": 200000,
-                "remaining_tokens": 143600,
-                "rate_limits": {
-                    "primary": {"window_minutes": 300, "used_percent": 3.0},
-                    "secondary": {"window_minutes": 10080, "used_percent": 12.5},
-                },
-            }
-        ),
-    )
-
     await handle_photo(update, context)
 
     kwargs = run_command.await_args.kwargs
@@ -297,7 +277,7 @@ async def test_photo_upload_codex_passes_cli_image_file_and_cleans_up(
     assert any("Starting Codex" in text for text in edited_texts)
     assert any("Codex is working" in text for text in edited_texts)
     assert not any(text.count("Codex is working") > 1 for text in edited_texts)
-    assert any("Session context" in text for text in edited_texts)
+    assert not any("Session context" in text for text in edited_texts)
 
 
 @pytest.mark.asyncio
