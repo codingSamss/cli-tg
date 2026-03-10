@@ -10,7 +10,9 @@ Features:
 import asyncio
 import json
 import os
+import pty
 import re
+import select
 import uuid
 from asyncio.subprocess import Process
 from collections import deque
@@ -105,6 +107,74 @@ class StreamUpdate:
 StreamCallback = Callable[[StreamUpdate], Awaitable[None]]
 
 
+def _elapsed_ms(started_at: float, current_at: Optional[float] = None) -> int:
+    """Return non-negative milliseconds elapsed from a monotonic timestamp."""
+    end_at = asyncio.get_event_loop().time() if current_at is None else current_at
+    return max(0, int((end_at - started_at) * 1000))
+
+
+@dataclass
+class ProcessOutputDiagnostics:
+    """Track coarse subprocess output timings for latency attribution."""
+
+    process_started_monotonic: float
+    stdout_event_count: int = 0
+    command_progress_count: int = 0
+    tool_result_count: int = 0
+    first_stdout_event_ms: Optional[int] = None
+    last_stdout_event_ms: Optional[int] = None
+    result_received_ms: Optional[int] = None
+
+    def mark_stdout_event(
+        self,
+        *,
+        current_at: float,
+        update: Optional[StreamUpdate],
+    ) -> None:
+        """Track the timing and type of each parsed stdout JSON event."""
+        elapsed_ms = _elapsed_ms(self.process_started_monotonic, current_at)
+        self.stdout_event_count += 1
+        if self.first_stdout_event_ms is None:
+            self.first_stdout_event_ms = elapsed_ms
+        self.last_stdout_event_ms = elapsed_ms
+
+        if not update:
+            return
+        metadata = update.metadata if isinstance(update.metadata, dict) else {}
+        if update.type == "tool_result":
+            self.tool_result_count += 1
+        if metadata.get("item_type") == "command_execution":
+            self.command_progress_count += 1
+
+    def mark_result(self, *, current_at: float) -> None:
+        """Track when the final result/turn completion arrived on stdout."""
+        self.result_received_ms = _elapsed_ms(self.process_started_monotonic, current_at)
+
+    def to_log_fields(self, *, process_wall_ms: int) -> Dict[str, Any]:
+        """Render diagnostics as structured log fields."""
+        silent_after_last_stdout_ms = None
+        if self.last_stdout_event_ms is not None:
+            silent_after_last_stdout_ms = max(
+                0, int(process_wall_ms) - int(self.last_stdout_event_ms)
+            )
+        post_result_wait_ms = None
+        if self.result_received_ms is not None:
+            post_result_wait_ms = max(
+                0, int(process_wall_ms) - int(self.result_received_ms)
+            )
+        return {
+            "process_wall_ms": max(0, int(process_wall_ms)),
+            "stdout_event_count": self.stdout_event_count,
+            "first_stdout_event_ms": self.first_stdout_event_ms,
+            "last_stdout_event_ms": self.last_stdout_event_ms,
+            "result_received_ms": self.result_received_ms,
+            "silent_after_last_stdout_ms": silent_after_last_stdout_ms,
+            "post_result_wait_ms": post_result_wait_ms,
+            "command_progress_count": self.command_progress_count,
+            "tool_result_count": self.tool_result_count,
+        }
+
+
 class ClaudeProcessManager:
     """Manage Claude Code subprocess execution with memory optimization."""
 
@@ -165,6 +235,7 @@ class ClaudeProcessManager:
             self.active_processes[process_id] = process
 
             # Handle output with timeout
+            process_started_at = asyncio.get_event_loop().time()
             result = await asyncio.wait_for(
                 self._handle_process_output(
                     process,
@@ -173,12 +244,14 @@ class ClaudeProcessManager:
                 ),
                 timeout=timeout_seconds,
             )
+            process_wall_ms = _elapsed_ms(process_started_at)
 
             logger.info(
                 "Claude Code process completed successfully",
                 process_id=process_id,
                 cost=result.cost,
                 duration_ms=result.duration_ms,
+                process_wall_ms=process_wall_ms,
             )
 
             return result
@@ -440,6 +513,197 @@ class ClaudeProcessManager:
             limit=1024 * 1024 * 512,  # 512MB
         )
 
+    async def probe_codex_status_command(
+        self,
+        *,
+        working_directory: Path,
+        session_id: str,
+        timeout_seconds: int,
+        slash_command: str = "/status",
+    ) -> ClaudeResponse:
+        """Run an interactive Codex slash command in a PTY and capture plain text."""
+        normalized_session_id = str(session_id or "").strip()
+        normalized_command = str(slash_command or "").strip() or "/status"
+        if not normalized_session_id:
+            raise ClaudeProcessError("Codex status probe requires a session ID")
+
+        cli_path = self._resolve_cli_path()
+        if self._detect_cli_kind(cli_path) != "codex":
+            raise ClaudeProcessError(
+                "Interactive status probe is only supported for Codex"
+            )
+
+        cmd = [cli_path]
+        if not self.config.codex_enable_mcp:
+            cmd.extend(["-c", "mcp_servers={}"])
+        cmd.extend(["resume", normalized_session_id, "--no-alt-screen"])
+
+        started_at = asyncio.get_event_loop().time()
+        content = await self._run_codex_interactive_probe(
+            cmd=cmd,
+            working_directory=working_directory,
+            slash_command=normalized_command,
+            timeout_seconds=max(int(timeout_seconds or 0), 1),
+        )
+        duration_ms = int((asyncio.get_event_loop().time() - started_at) * 1000)
+        return ClaudeResponse(
+            content=content,
+            session_id=normalized_session_id,
+            cost=0.0,
+            duration_ms=duration_ms,
+            num_turns=0,
+        )
+
+    async def _run_codex_interactive_probe(
+        self,
+        *,
+        cmd: List[str],
+        working_directory: Path,
+        slash_command: str,
+        timeout_seconds: int,
+    ) -> str:
+        """Drive an interactive Codex session long enough to execute one slash command."""
+        env = os.environ.copy()
+        env.pop("CLAUDECODE", None)
+
+        master_fd, slave_fd = pty.openpty()
+        process: Optional[Process] = None
+        raw_output = ""
+        extracted_snapshot = ""
+        command_sent = False
+        startup_seen = False
+        idle_ticks = 0
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + max(timeout_seconds, 1)
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                cwd=str(working_directory),
+                env=env,
+            )
+        finally:
+            os.close(slave_fd)
+
+        try:
+            while loop.time() < deadline:
+                chunk = await asyncio.to_thread(self._read_pty_chunk, master_fd, 0.25)
+                if chunk:
+                    raw_output += chunk.decode("utf-8", errors="replace")
+                    idle_ticks = 0
+                else:
+                    idle_ticks += 1
+
+                cleaned = self._strip_terminal_control_sequences(raw_output)
+                if cleaned:
+                    if (
+                        "OpenAI Codex" in cleaned
+                        or "context left" in cleaned
+                        or "tab to queue message" in cleaned
+                    ):
+                        startup_seen = True
+
+                if not command_sent and startup_seen and idle_ticks >= 2:
+                    os.write(master_fd, slash_command.encode("utf-8"))
+                    os.write(master_fd, b"\r")
+                    command_sent = True
+                    idle_ticks = 0
+                    continue
+
+                if command_sent:
+                    extracted_snapshot = self._extract_codex_status_snapshot(cleaned)
+                    if extracted_snapshot:
+                        return extracted_snapshot
+
+                if process.returncode is not None and not chunk:
+                    break
+
+            cleaned = self._strip_terminal_control_sequences(raw_output)
+            if extracted_snapshot:
+                return extracted_snapshot
+            return self._extract_codex_status_snapshot(cleaned) or cleaned
+        finally:
+            try:
+                os.write(master_fd, b"\x03")
+            except OSError:
+                pass
+
+            if process is not None:
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=3)
+                except asyncio.TimeoutError:
+                    process.kill()
+                    await process.wait()
+            os.close(master_fd)
+
+    @staticmethod
+    def _read_pty_chunk(fd: int, timeout_seconds: float) -> bytes:
+        """Read one PTY chunk with a small timeout."""
+        ready, _, _ = select.select([fd], [], [], max(timeout_seconds, 0.0))
+        if not ready:
+            return b""
+        try:
+            return os.read(fd, 65536)
+        except OSError:
+            return b""
+
+    @staticmethod
+    def _strip_terminal_control_sequences(text: str) -> str:
+        """Remove ANSI/terminal control sequences from a PTY transcript."""
+        if not text:
+            return ""
+        ansi_pattern = re.compile(
+            r"""
+            \x1B\[[0-?]*[ -/]*[@-~]
+            |\x1B\][^\x07]*(?:\x07|\x1B\\)
+            |\x1B[@-Z\\-_]
+            """,
+            re.VERBOSE | re.DOTALL,
+        )
+        cleaned = ansi_pattern.sub("", text)
+        cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
+        cleaned = cleaned.replace("\x00", "")
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
+
+    @staticmethod
+    def _extract_codex_status_snapshot(text: str) -> str:
+        """Extract stable lines from interactive Codex `/status` output."""
+        if not text:
+            return ""
+        labels = (
+            "Visit https://chatgpt.com/codex/settings/usage",
+            "information on rate limits and credits",
+            "Model:",
+            "Directory:",
+            "Permissions:",
+            "Agents.md:",
+            "Account:",
+            "Collaboration mode:",
+            "Session:",
+            "Context window:",
+            "5h limit:",
+            "Weekly limit:",
+        )
+        lines: List[str] = []
+        seen = set()
+        for raw_line in text.splitlines():
+            line = raw_line.strip().strip("│").strip()
+            if not line:
+                continue
+            if not any(label in line for label in labels):
+                continue
+            if line in seen:
+                continue
+            seen.add(line)
+            lines.append(line)
+        if not any("Context window:" in line for line in lines):
+            return ""
+        return "\n".join(lines)
+
     async def _handle_process_output(
         self,
         process: Process,
@@ -453,6 +717,8 @@ class ClaudeProcessManager:
         parsing_errors = []
         codex_thread_id = ""
         codex_emitted_model = ""
+        started_at = asyncio.get_event_loop().time()
+        diagnostics = ProcessOutputDiagnostics(process_started_monotonic=started_at)
 
         stdout_reader = process.stdout
         if stdout_reader is None:
@@ -481,6 +747,10 @@ class ClaudeProcessManager:
 
                 # Process immediately to avoid memory buildup
                 update = self._parse_stream_message(msg)
+                diagnostics.mark_stdout_event(
+                    current_at=asyncio.get_event_loop().time(),
+                    update=update,
+                )
                 if update and stream_callback:
                     try:
                         await stream_callback(update)
@@ -519,6 +789,9 @@ class ClaudeProcessManager:
                     and msg_type in {"turn.completed", "turn.failed"}
                 ):
                     result = msg
+                    diagnostics.mark_result(
+                        current_at=asyncio.get_event_loop().time()
+                    )
 
             except json.JSONDecodeError as e:
                 parsing_errors.append(f"JSON decode error: {e}")
@@ -537,6 +810,14 @@ class ClaudeProcessManager:
 
         # Wait for process to complete
         return_code = await process.wait()
+        logger.info(
+            "Claude subprocess output diagnostics",
+            cli_kind=cli_kind,
+            return_code=return_code,
+            **diagnostics.to_log_fields(
+                process_wall_ms=_elapsed_ms(started_at)
+            ),
+        )
 
         if return_code != 0:
             stderr_reader = process.stderr

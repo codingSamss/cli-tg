@@ -7,6 +7,8 @@ import re
 import time
 from collections import Counter
 from collections.abc import MutableMapping
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Optional
@@ -21,6 +23,8 @@ from ...claude.task_registry import TaskRegistry
 from ...config.settings import Settings
 from ...security.audit import AuditLogger
 from ...security.validators import SecurityValidator
+from ...services.session_service import SessionService
+from ...utils.codex_rate_limits import format_rate_limit_summary
 from ..inbound_task_queue import InboundTaskQueue
 from ..utils.cli_engine import (
     ENGINE_CLAUDE,
@@ -139,6 +143,119 @@ _STATUS_REACTION_WEB_TOOL_TOKENS = (
     "web-fetch",
     "browser",
 )
+
+
+def _elapsed_monotonic_ms(
+    started_at: float, current_at: Optional[float] = None
+) -> int:
+    """Return non-negative milliseconds elapsed from a monotonic timestamp."""
+    end_at = time.monotonic() if current_at is None else current_at
+    return max(0, int((end_at - started_at) * 1000))
+
+
+@dataclass
+class _RequestTimingDiagnostics:
+    """Collect coarse-grained timing diagnostics for one inbound text request."""
+
+    request_started_monotonic: float
+    progress_init_send_ms: Optional[int] = None
+    command_wall_ms: Optional[int] = None
+    first_stream_update_ms: Optional[int] = None
+    first_assistant_text_ms: Optional[int] = None
+    first_tool_activity_ms: Optional[int] = None
+    last_stream_update_ms: Optional[int] = None
+    stream_update_count: int = 0
+    command_progress_count: int = 0
+    tool_activity_count: int = 0
+    tg_progress_edit_count: int = 0
+    tg_progress_edit_total_ms: int = 0
+    tg_progress_refresh_count: int = 0
+    tg_progress_refresh_total_ms: int = 0
+    tg_progress_timeout_count: int = 0
+    final_reply_count: int = 0
+    final_reply_total_ms: int = 0
+    final_draft_count: int = 0
+    final_draft_total_ms: int = 0
+
+    def mark_stream_update(self, update_obj: Any) -> None:
+        """Track first/last stream activity and tool-related progress."""
+        current_at = time.monotonic()
+        elapsed_ms = _elapsed_monotonic_ms(
+            self.request_started_monotonic, current_at
+        )
+        self.stream_update_count += 1
+        if self.first_stream_update_ms is None:
+            self.first_stream_update_ms = elapsed_ms
+        self.last_stream_update_ms = elapsed_ms
+
+        update_type = str(getattr(update_obj, "type", "") or "").strip().lower()
+        update_content = str(getattr(update_obj, "content", "") or "").strip()
+        tool_calls = getattr(update_obj, "tool_calls", None)
+        metadata = getattr(update_obj, "metadata", None)
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        if (
+            update_type == "assistant"
+            and update_content
+            and not tool_calls
+            and self.first_assistant_text_ms is None
+        ):
+            self.first_assistant_text_ms = elapsed_ms
+
+        is_command_progress = metadata.get("item_type") == "command_execution"
+        has_tool_activity = bool(tool_calls) or update_type == "tool_result"
+        if is_command_progress:
+            self.command_progress_count += 1
+            has_tool_activity = True
+        if has_tool_activity:
+            self.tool_activity_count += 1
+            if self.first_tool_activity_ms is None:
+                self.first_tool_activity_ms = elapsed_ms
+
+    def record_progress_edit(self, elapsed_ms: int) -> None:
+        """Record one successful progress message edit."""
+        self.tg_progress_edit_count += 1
+        self.tg_progress_edit_total_ms += max(0, int(elapsed_ms))
+
+    def record_progress_refresh(self, elapsed_ms: int) -> None:
+        """Record one refresh-by-new-message after edit timeout/failure."""
+        self.tg_progress_refresh_count += 1
+        self.tg_progress_refresh_total_ms += max(0, int(elapsed_ms))
+
+    def record_final_reply(self, elapsed_ms: int) -> None:
+        """Record one outbound final reply send."""
+        self.final_reply_count += 1
+        self.final_reply_total_ms += max(0, int(elapsed_ms))
+
+    def record_final_draft(self, elapsed_ms: int) -> None:
+        """Record one private draft send before the final answer."""
+        self.final_draft_count += 1
+        self.final_draft_total_ms += max(0, int(elapsed_ms))
+
+    def to_log_fields(self, *, total_wall_ms: int) -> dict[str, Any]:
+        """Render diagnostics as structured log fields."""
+        return {
+            "request_total_wall_ms": max(0, int(total_wall_ms)),
+            "progress_init_send_ms": self.progress_init_send_ms,
+            "command_wall_ms": self.command_wall_ms,
+            "first_stream_update_ms": self.first_stream_update_ms,
+            "first_assistant_text_ms": self.first_assistant_text_ms,
+            "first_tool_activity_ms": self.first_tool_activity_ms,
+            "last_stream_update_ms": self.last_stream_update_ms,
+            "stream_update_count": self.stream_update_count,
+            "command_progress_count": self.command_progress_count,
+            "tool_activity_count": self.tool_activity_count,
+            "tg_progress_edit_count": self.tg_progress_edit_count,
+            "tg_progress_edit_total_ms": self.tg_progress_edit_total_ms,
+            "tg_progress_refresh_count": self.tg_progress_refresh_count,
+            "tg_progress_refresh_total_ms": self.tg_progress_refresh_total_ms,
+            "tg_progress_timeout_count": self.tg_progress_timeout_count,
+            "final_reply_count": self.final_reply_count,
+            "final_reply_total_ms": self.final_reply_total_ms,
+            "final_draft_count": self.final_draft_count,
+            "final_draft_total_ms": self.final_draft_total_ms,
+        }
 
 
 def _escape_md(text: str) -> str:
@@ -1233,6 +1350,14 @@ async def _enqueue_busy_text_task(
         source_message_id=source_message_id,
         executor=_replay,
     )
+    logger.info(
+        "Queued inbound text task",
+        user_id=user_id,
+        scope_key=scope_key,
+        queue_id=queued_item.queue_id,
+        queue_position=position,
+        source_message_id=source_message_id,
+    )
     return queued_item.queue_id, position
 
 
@@ -1372,6 +1497,13 @@ async def _dispatch_next_inbound_task(
         scope_key=scope_key,
         queue_id=queued_item.queue_id,
         kind=queued_item.kind,
+        queue_wait_ms=max(
+            0,
+            int(
+                (datetime.now() - queued_item.created_at).total_seconds()
+                * 1000
+            ),
+        ),
     )
     asyncio.create_task(_run_queued_task())
 
@@ -2044,6 +2176,30 @@ def _build_session_context_summary(snapshot: Optional[dict[str, Any]]) -> Option
     return "🔋 Session context: " f"`{remaining_percent:.1f}%` remaining"
 
 
+def _resolve_codex_context_snapshot(
+    *,
+    active_engine: str | None,
+    session_id: Optional[str],
+) -> tuple[Optional[dict[str, Any]], Optional[str], Optional[str]]:
+    """Resolve cached Codex snapshot and compact summary lines for UI tags."""
+    if normalize_cli_engine(active_engine) != ENGINE_CODEX:
+        return None, None, None
+
+    sid = str(session_id or "").strip()
+    if not sid:
+        return None, None, None
+
+    snapshot = SessionService.get_cached_codex_snapshot(sid)
+    if not isinstance(snapshot, dict):
+        return None, None, None
+
+    return (
+        snapshot,
+        _build_session_context_summary(snapshot),
+        format_rate_limit_summary(snapshot.get("rate_limits")),
+    )
+
+
 def _extract_model_from_model_usage(model_usage: Any) -> Optional[str]:
     """Best-effort extract resolved model name from response model_usage payload."""
     if not isinstance(model_usage, dict) or not model_usage:
@@ -2490,6 +2646,13 @@ async def handle_text_message(
     progress_msg: Any = None
     all_progress_lines: list[str] = []
     frozen_messages: list[Any] = []
+    request_timing = _RequestTimingDiagnostics(
+        request_started_monotonic=time.monotonic()
+    )
+    request_outcome = "running"
+    active_engine = ENGINE_CLAUDE
+    claude_response = None
+    response_message_count = 0
 
     try:
         # Check if user already has an active task
@@ -2504,6 +2667,7 @@ async def handle_text_message(
                 source_message_id=input_message_id,
             )
             if queued_meta is None:
+                request_outcome = "busy_rejected"
                 await _reply_text_resilient(
                     telegram_message,
                     "A task is already running. Use /cancel to cancel it.",
@@ -2511,6 +2675,7 @@ async def handle_text_message(
             else:
                 queue_id, position = queued_meta
                 pending_before = max(position - 1, 0)
+                request_outcome = "queued"
                 await _reply_text_resilient(
                     telegram_message,
                     (
@@ -2541,6 +2706,7 @@ async def handle_text_message(
         storage = context.bot_data.get("storage")
 
         if not cli_integration:
+            request_outcome = "engine_unavailable"
             await _reply_text_resilient(
                 telegram_message,
                 _with_engine_badge(
@@ -2560,12 +2726,16 @@ async def handle_text_message(
         cancel_keyboard = InlineKeyboardMarkup(
             [[InlineKeyboardButton("Cancel", callback_data="cancel:task")]]
         )
+        progress_init_started_at = time.monotonic()
         progress_msg = await _reply_text_resilient(
             telegram_message,
             _with_engine_badge(initial_thinking_line, active_engine),
             parse_mode="Markdown",
             reply_to_message_id=input_message_id,
             reply_markup=cancel_keyboard,
+        )
+        request_timing.progress_init_send_ms = _elapsed_monotonic_ms(
+            progress_init_started_at
         )
         reaction_controller = _MessageStatusReactionController(
             enabled=getattr(settings, "status_reactions_enabled", True),
@@ -2640,19 +2810,27 @@ async def handle_text_message(
                         await progress_msg.edit_reply_markup(reply_markup=None)
                     except Exception:
                         pass
+                    refresh_started_at = time.monotonic()
                     progress_msg = await _reply_text_resilient(
                         progress_msg,
                         text_to_send,
                         parse_mode="Markdown",
                         reply_markup=cancel_keyboard,
                     )
+                    request_timing.record_progress_refresh(
+                        _elapsed_monotonic_ms(refresh_started_at)
+                    )
                     last_progress_edit_ts = stream_loop.time()
 
                 try:
+                    edit_started_at = time.monotonic()
                     await progress_msg.edit_text(
                         text_to_send,
                         parse_mode="Markdown",
                         reply_markup=cancel_keyboard,
+                    )
+                    request_timing.record_progress_edit(
+                        _elapsed_monotonic_ms(edit_started_at)
                     )
                     last_progress_text = text_to_send
                     last_progress_edit_ts = stream_loop.time()
@@ -2665,9 +2843,13 @@ async def handle_text_message(
                     fallback_error: Exception | None = None
                     timeout_error = _is_timeout_error(e)
                     try:
+                        fallback_edit_started_at = time.monotonic()
                         await progress_msg.edit_text(
                             text_to_send,
                             reply_markup=cancel_keyboard,
+                        )
+                        request_timing.record_progress_edit(
+                            _elapsed_monotonic_ms(fallback_edit_started_at)
                         )
                         last_progress_text = text_to_send
                         last_progress_edit_ts = stream_loop.time()
@@ -2679,6 +2861,7 @@ async def handle_text_message(
                             return
                         timeout_error = timeout_error or _is_timeout_error(exc)
                     if timeout_error:
+                        request_timing.tg_progress_timeout_count += 1
                         await _refresh_with_new_message()
                         last_progress_text = text_to_send
                         return
@@ -2718,6 +2901,7 @@ async def handle_text_message(
             nonlocal progress_msg, last_progress_text, pending_progress_text
             nonlocal last_progress_edit_ts, turn_started_shown
             try:
+                request_timing.mark_stream_update(update_obj)
                 await _update_stream_reaction_status(reaction_controller, update_obj)
                 if _is_turn_started_update(update_obj):
                     if turn_started_shown:
@@ -2865,9 +3049,9 @@ async def handle_text_message(
                 scope_key=scope_key,
             )
 
-        claude_response = None
         command_succeeded = False
         blocked_local_image_fallback = False
+        command_wait_started = time.monotonic()
         try:
             claude_response = await task
             command_succeeded = True
@@ -2920,6 +3104,7 @@ async def handle_text_message(
             )
 
         except asyncio.CancelledError:
+            request_outcome = "cancelled"
             logger.info("Claude task cancelled by user", user_id=user_id)
             await _cancel_progress_flush_task()
             if task_registry:
@@ -2975,6 +3160,7 @@ async def handle_text_message(
                 )
             return
         except ClaudeToolValidationError as e:
+            request_outcome = "tool_validation_error"
             # Tool validation error with detailed instructions
             logger.error(
                 "Tool validation error",
@@ -2987,6 +3173,7 @@ async def handle_text_message(
 
             formatted_messages = [FormattedMessage(str(e), parse_mode="Markdown")]
         except Exception as e:
+            request_outcome = "command_error"
             logger.error(
                 "CLI integration failed",
                 error=str(e),
@@ -3004,6 +3191,11 @@ async def handle_text_message(
                     parse_mode="Markdown",
                 )
             ]
+        finally:
+            if request_timing.command_wall_ms is None:
+                request_timing.command_wall_ms = _elapsed_monotonic_ms(
+                    command_wait_started
+                )
 
         # Clean up task registry
         if task_registry:
@@ -3011,12 +3203,19 @@ async def handle_text_message(
         await _cancel_progress_flush_task()
 
         # Build context tag for display in thinking summary or reply header
-        codex_snapshot = None
+        codex_snapshot, session_context_summary, rate_limit_summary = (
+            _resolve_codex_context_snapshot(
+                active_engine=active_engine,
+                session_id=scope_state.get("claude_session_id"),
+            )
+        )
         context_tag = _build_context_tag(
             scope_state=scope_state,
             approved_directory=settings.approved_directory,
             active_engine=active_engine,
             session_id=scope_state.get("claude_session_id"),
+            session_context_summary=session_context_summary,
+            rate_limit_summary=rate_limit_summary,
         )
         collapsed_fallback_model = _resolve_collapsed_fallback_model(
             active_engine=active_engine,
@@ -3080,6 +3279,7 @@ async def handle_text_message(
 
         # Send formatted responses (may be multiple messages)
         final_draft_sent = False
+        response_message_count = len(formatted_messages)
         for i, message in enumerate(formatted_messages):
             try:
                 msg_text = message.text
@@ -3090,6 +3290,7 @@ async def handle_text_message(
                     if len(context_prefix) + len(msg_text) <= _TELEGRAM_MESSAGE_LIMIT:
                         msg_text = context_prefix + msg_text
                     else:
+                        context_send_started_at = time.monotonic()
                         await _reply_text_resilient(
                             telegram_message,
                             context_tag,
@@ -3098,9 +3299,13 @@ async def handle_text_message(
                             bot=context.bot,
                             chat_type=getattr(effective_chat, "type", None),
                         )
+                        request_timing.record_final_reply(
+                            _elapsed_monotonic_ms(context_send_started_at)
+                        )
                         reply_to_id = None
 
                 if i == 0 and not final_draft_sent:
+                    final_draft_started_at = time.monotonic()
                     final_draft_sent = await _send_private_final_response_draft(
                         bot=context.bot,
                         chat_id=input_chat_id,
@@ -3110,7 +3315,12 @@ async def handle_text_message(
                         text=msg_text,
                         parse_mode=message.parse_mode,
                     )
+                    if final_draft_sent:
+                        request_timing.record_final_draft(
+                            _elapsed_monotonic_ms(final_draft_started_at)
+                        )
 
+                final_reply_started_at = time.monotonic()
                 await _reply_text_resilient(
                     telegram_message,
                     msg_text,
@@ -3119,6 +3329,9 @@ async def handle_text_message(
                     reply_to_message_id=reply_to_id,
                     bot=context.bot,
                     chat_type=getattr(effective_chat, "type", None),
+                )
+                request_timing.record_final_reply(
+                    _elapsed_monotonic_ms(final_reply_started_at)
                 )
 
                 # Small delay between messages to avoid rate limits
@@ -3183,9 +3396,11 @@ async def handle_text_message(
                 success=True,
             )
 
+        request_outcome = "success"
         logger.info("Text message processed successfully", user_id=user_id)
 
     except Exception as e:
+        request_outcome = "handler_error"
         # Clean up progress message: collapse to summary if possible
         try:
             if all_progress_lines:
@@ -3252,6 +3467,24 @@ async def handle_text_message(
 
         logger.error("Error processing text message", error=str(e), user_id=user_id)
     finally:
+        logger.info(
+            "Text message timing diagnostics",
+            user_id=user_id,
+            scope_key=scope_key,
+            outcome=request_outcome,
+            engine=active_engine,
+            session_id=(
+                getattr(claude_response, "session_id", None)
+                or scope_state.get("claude_session_id")
+            ),
+            cli_reported_duration_ms=getattr(claude_response, "duration_ms", None),
+            response_message_count=response_message_count,
+            **request_timing.to_log_fields(
+                total_wall_ms=_elapsed_monotonic_ms(
+                    request_timing.request_started_monotonic
+                )
+            ),
+        )
         if reaction_controller:
             await reaction_controller.shutdown()
         typing_stop_event.set()
@@ -3505,11 +3738,19 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await claude_progress_msg.delete()
 
             # Build context tag for CLI mode reply header
+            _, cli_session_context_summary, cli_rate_limit_summary = (
+                _resolve_codex_context_snapshot(
+                    active_engine=active_engine,
+                    session_id=scope_state.get("claude_session_id"),
+                )
+            )
             cli_context_tag = _build_context_tag(
                 scope_state=scope_state,
                 approved_directory=settings.approved_directory,
                 active_engine=active_engine,
                 session_id=scope_state.get("claude_session_id"),
+                session_context_summary=cli_session_context_summary,
+                rate_limit_summary=cli_rate_limit_summary,
             )
 
             # Send responses
@@ -4191,12 +4432,19 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 )
 
                 # Build context tag for image response
-                img_codex_snapshot = None
+                img_codex_snapshot, img_session_context_summary, img_rate_limit_summary = (
+                    _resolve_codex_context_snapshot(
+                        active_engine=active_engine,
+                        session_id=scope_state.get("claude_session_id"),
+                    )
+                )
                 img_context_tag = _build_context_tag(
                     scope_state=scope_state,
                     approved_directory=settings.approved_directory,
                     active_engine=active_engine,
                     session_id=scope_state.get("claude_session_id"),
+                    session_context_summary=img_session_context_summary,
+                    rate_limit_summary=img_rate_limit_summary,
                 )
                 img_fallback_model = _resolve_collapsed_fallback_model(
                     active_engine=active_engine,

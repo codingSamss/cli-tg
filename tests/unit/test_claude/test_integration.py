@@ -8,7 +8,11 @@ from unittest.mock import AsyncMock
 import pytest
 
 from src.claude.exceptions import ClaudeProcessError
-from src.claude.integration import ClaudeProcessManager
+from src.claude.integration import (
+    ClaudeProcessManager,
+    ProcessOutputDiagnostics,
+    StreamUpdate,
+)
 from src.config.settings import Settings
 
 
@@ -143,7 +147,9 @@ def test_build_command_for_codex_exec_includes_image_flags(tmp_path, monkeypatch
     ]
 
 
-def test_build_command_for_codex_exec_without_prompt_uses_default(tmp_path, monkeypatch):
+def test_build_command_for_codex_exec_without_prompt_uses_default(
+    tmp_path, monkeypatch
+):
     """Codex exec should always include a non-empty prompt argument."""
     manager = _build_manager(tmp_path, codex_enable_mcp=False)
     monkeypatch.setattr(
@@ -322,6 +328,67 @@ def test_build_command_for_codex_resume_without_prompt_uses_default(
         "thread-123",
         "--",
         "Please continue where we left off",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_probe_codex_status_command_uses_interactive_resume(
+    tmp_path, monkeypatch
+):
+    """Codex status probe should use interactive `resume`, not `exec resume`."""
+    manager = _build_manager(tmp_path, codex_enable_mcp=False)
+    monkeypatch.setattr(
+        "src.claude.sdk_integration.find_claude_cli",
+        lambda _: "/usr/local/bin/codex",
+    )
+
+    captured = {}
+
+    async def _fake_probe(**kwargs):
+        captured.update(kwargs)
+        return "Context window: 56% left (120K used / 258K)"
+
+    monkeypatch.setattr(manager, "_run_codex_interactive_probe", _fake_probe)
+
+    response = await manager.probe_codex_status_command(
+        working_directory=tmp_path,
+        session_id="thread-123",
+        timeout_seconds=12,
+    )
+
+    assert response.content == "Context window: 56% left (120K used / 258K)"
+    assert response.session_id == "thread-123"
+    assert captured["cmd"] == [
+        "/usr/local/bin/codex",
+        "-c",
+        "mcp_servers={}",
+        "resume",
+        "thread-123",
+        "--no-alt-screen",
+    ]
+    assert captured["slash_command"] == "/status"
+
+
+def test_extract_codex_status_snapshot_keeps_stable_status_lines(tmp_path):
+    """PTY cleanup should keep the useful `/status` lines only once."""
+    manager = _build_manager(tmp_path)
+
+    snapshot = manager._extract_codex_status_snapshot(
+        "noise line\n"
+        "Model: gpt-5.4 (reasoning xhigh, summaries auto)\n"
+        "Session: 019cd398\n"
+        "Context window: 56% left (120K used / 258K)\n"
+        "5h limit: [██] 58% left (resets 03:16)\n"
+        "Weekly limit: [█] 17% left (resets 17:53)\n"
+        "Context window: 56% left (120K used / 258K)\n"
+    )
+
+    assert snapshot.splitlines() == [
+        "Model: gpt-5.4 (reasoning xhigh, summaries auto)",
+        "Session: 019cd398",
+        "Context window: 56% left (120K used / 258K)",
+        "5h limit: [██] 58% left (resets 03:16)",
+        "Weekly limit: [█] 17% left (resets 17:53)",
     ]
 
 
@@ -575,6 +642,36 @@ def test_parse_stream_message_supports_codex_turn_context_model(tmp_path):
     assert update.metadata and update.metadata.get("subtype") == "model_resolved"
     assert update.metadata and update.metadata.get("engine") == "codex"
     assert update.metadata and update.metadata.get("model") == "gpt-5.2-codex"
+
+
+def test_process_output_diagnostics_compute_silence_and_result_gaps():
+    """Process diagnostics should separate stdout activity from end-to-end wall time."""
+    diagnostics = ProcessOutputDiagnostics(process_started_monotonic=10.0)
+
+    diagnostics.mark_stdout_event(
+        current_at=11.0,
+        update=StreamUpdate(
+            type="progress",
+            metadata={"item_type": "command_execution", "status": "in_progress"},
+        ),
+    )
+    diagnostics.mark_stdout_event(
+        current_at=12.5,
+        update=StreamUpdate(type="tool_result", metadata={}),
+    )
+    diagnostics.mark_result(current_at=13.0)
+
+    fields = diagnostics.to_log_fields(process_wall_ms=15000)
+
+    assert fields["process_wall_ms"] == 15000
+    assert fields["stdout_event_count"] == 2
+    assert fields["first_stdout_event_ms"] == 1000
+    assert fields["last_stdout_event_ms"] == 2500
+    assert fields["result_received_ms"] == 3000
+    assert fields["silent_after_last_stdout_ms"] == 12500
+    assert fields["post_result_wait_ms"] == 12000
+    assert fields["command_progress_count"] == 1
+    assert fields["tool_result_count"] == 1
 
 
 @pytest.mark.asyncio

@@ -466,7 +466,7 @@ kubectl apply -f k8s/
 - 调整配置中的 `RATE_LIMIT_REQUESTS`
 - 检查用户是否超出费用限额
 
-更多请参见 [docs/troubleshooting.md](docs/troubleshooting.md)。
+更多请参见 [docs/troubleshooting.md](../troubleshooting.md)。
 
 ## 许可证
 

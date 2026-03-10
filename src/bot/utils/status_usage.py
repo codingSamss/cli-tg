@@ -202,6 +202,9 @@ def _build_rate_limit_lines(rate_limits: Any) -> List[str]:
             "used_percent": used_percent,
             "window_minutes": window_minutes,
         }
+        reset_text_raw = str(entry.get("resets_at_text") or "").strip()
+        if reset_text_raw:
+            normalized["resets_at_text"] = reset_text_raw
         resets_at_raw = entry.get("resets_at")
         if resets_at_raw is not None:
             try:
@@ -227,7 +230,9 @@ def _build_rate_limit_lines(rate_limits: Any) -> List[str]:
         label = _window_label(window_minutes)
         used_percent = max(min(float(entry["used_percent"]), 100.0), 0.0)
         remaining_percent = max(min(100.0 - used_percent, 100.0), 0.0)
-        reset_text = _format_unix_timestamp(entry.get("resets_at"))
+        reset_text = str(entry.get("resets_at_text") or "").strip()
+        if not reset_text:
+            reset_text = _format_unix_timestamp(entry.get("resets_at"))
         line = f"{label}: `{remaining_percent:.1f}% remaining`"
         if reset_text:
             line += f" (resets `{reset_text}`)"

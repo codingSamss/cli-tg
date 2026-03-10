@@ -196,6 +196,30 @@ def test_build_precise_context_status_lines_can_render_windows_without_context()
     assert "7d window: `45.0% remaining`" in joined
 
 
+def test_build_precise_context_status_lines_prefers_reset_text_hint():
+    """Interactive Codex `/status` may only expose reset wall-clock text."""
+    lines = build_precise_context_status_lines(
+        {
+            "rate_limits": {
+                "primary": {
+                    "used_percent": 42.0,
+                    "window_minutes": 300,
+                    "resets_at_text": "03:16",
+                },
+                "secondary": {
+                    "used_percent": 83.0,
+                    "window_minutes": 10_080,
+                    "resets_at_text": "17:53",
+                },
+            }
+        }
+    )
+
+    joined = "\n".join(lines)
+    assert "5h window: `58.0% remaining` (resets `03:16`)" in joined
+    assert "7d window: `17.0% remaining` (resets `17:53`)" in joined
+
+
 def test_build_model_usage_status_lines_supports_codex_flat_usage_payload():
     """Codex turn usage payload (snake_case flat dict) should be rendered."""
     lines = build_model_usage_status_lines(

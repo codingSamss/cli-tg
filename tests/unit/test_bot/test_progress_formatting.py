@@ -1,5 +1,6 @@
 """Tests for streaming progress text formatting."""
 
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ from src.bot.handlers.message import (
     _append_progress_line_with_merge,
     _build_collapsed_thinking_summary,
     _build_context_tag,
+    _RequestTimingDiagnostics,
     _build_session_context_summary,
     _extract_model_from_model_usage,
     _format_error_message,
@@ -24,6 +26,7 @@ from src.bot.handlers.message import (
     _join_progress_lines_for_display,
     _reply_text_resilient,
     _resolve_collapsed_fallback_model,
+    _resolve_codex_context_snapshot,
     _send_private_final_response_draft,
     _split_text_for_telegram,
     _with_engine_badge,
@@ -32,6 +35,7 @@ from src.bot.handlers.message import (
 )
 from src.bot.inbound_task_queue import InboundTaskQueue
 from src.bot.utils.cli_engine import ENGINE_CLAUDE, ENGINE_CODEX
+from src.services.session_service import SessionService
 
 
 @dataclass
@@ -386,6 +390,44 @@ async def test_handle_text_message_busy_state_queues_request(tmp_path, monkeypat
     reply_markup = sent_kwargs[0].get("reply_markup")
     assert reply_markup is not None
     assert reply_markup.inline_keyboard[0][0].callback_data == "queue:dequeue:1"
+
+
+def test_request_timing_diagnostics_tracks_stream_and_send_metrics(monkeypatch):
+    """Request timing diagnostics should separate stream/tool/TG send stages."""
+    monotonic_values = iter([101.0, 102.5])
+    monkeypatch.setattr(
+        "src.bot.handlers.message.time.monotonic",
+        lambda: next(monotonic_values),
+    )
+
+    diagnostics = _RequestTimingDiagnostics(request_started_monotonic=100.0)
+
+    diagnostics.mark_stream_update(
+        _FakeUpdate(type="assistant", content="partial answer", tool_calls=None)
+    )
+    diagnostics.mark_stream_update(
+        _FakeUpdate(
+            type="progress",
+            metadata={"item_type": "command_execution", "status": "in_progress"},
+        )
+    )
+    diagnostics.record_progress_edit(120)
+    diagnostics.record_progress_refresh(340)
+    diagnostics.record_final_reply(560)
+    diagnostics.record_final_draft(80)
+
+    fields = diagnostics.to_log_fields(total_wall_ms=9000)
+
+    assert fields["first_stream_update_ms"] == 1000
+    assert fields["first_assistant_text_ms"] == 1000
+    assert fields["first_tool_activity_ms"] == 2500
+    assert fields["stream_update_count"] == 2
+    assert fields["command_progress_count"] == 1
+    assert fields["tool_activity_count"] == 1
+    assert fields["tg_progress_edit_total_ms"] == 120
+    assert fields["tg_progress_refresh_total_ms"] == 340
+    assert fields["final_reply_total_ms"] == 560
+    assert fields["final_draft_total_ms"] == 80
 
 
 @pytest.mark.asyncio
@@ -932,6 +974,41 @@ def test_build_session_context_summary_prefers_explicit_remaining_tokens():
     assert summary is not None
     assert "`71.8%` remaining" in summary
     assert "used" not in summary
+
+
+def test_resolve_codex_context_snapshot_reads_cached_session_usage():
+    """Collapsed/status tags should reuse the latest cached Codex snapshot."""
+    session_id = "session-codex-cached"
+    SessionService._codex_snapshot_cache[session_id] = (
+        time.monotonic(),
+        {
+            "used_percent": 13.8,
+            "total_tokens": 200_000,
+            "remaining_tokens": 172_400,
+            "resolved_model": "gpt-5.4",
+            "rate_limits": {
+                "primary": {"used_percent": 12.5, "window_minutes": 300},
+                "secondary": {"used_percent": 37.0, "window_minutes": 10_080},
+            },
+        },
+    )
+
+    try:
+        snapshot, session_summary, rate_limit_summary = (
+            _resolve_codex_context_snapshot(
+                active_engine=ENGINE_CODEX,
+                session_id=session_id,
+            )
+        )
+    finally:
+        SessionService._codex_snapshot_cache.pop(session_id, None)
+
+    assert snapshot is not None
+    assert snapshot["resolved_model"] == "gpt-5.4"
+    assert session_summary == "🔋 Session context: `86.2%` remaining"
+    assert rate_limit_summary is not None
+    assert "5h window: 87.5% remaining" in rate_limit_summary
+    assert "7d window: 63.0% remaining" in rate_limit_summary
 
 
 def test_build_collapsed_thinking_summary_keeps_model_and_context():

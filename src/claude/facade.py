@@ -4,6 +4,7 @@ Provides simple interface for bot handlers.
 """
 
 import asyncio
+import inspect
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional
@@ -733,20 +734,34 @@ class ClaudeIntegration:
         probe_runners: List[tuple[str, Callable[[], Any]]] = []
         process_manager = self.process_manager
         if process_manager:
-            probe_runners.append(
-                (
-                    "subprocess",
-                    lambda: process_manager.execute_command(
-                        prompt=probe_prompt,
-                        working_directory=working_directory,
-                        session_id=session_id,
-                        continue_session=True,
-                        model=model,
-                    ),
+            codex_probe = getattr(process_manager, "probe_codex_status_command", None)
+            if cli_kind == "codex" and inspect.iscoroutinefunction(codex_probe):
+                probe_runners.append(
+                    (
+                        "subprocess_interactive",
+                        lambda: codex_probe(
+                            working_directory=working_directory,
+                            session_id=session_id,
+                            timeout_seconds=probe_timeout,
+                            slash_command=probe_prompt,
+                        ),
+                    )
                 )
-            )
+            else:
+                probe_runners.append(
+                    (
+                        "subprocess",
+                        lambda: process_manager.execute_command(
+                            prompt=probe_prompt,
+                            working_directory=working_directory,
+                            session_id=session_id,
+                            continue_session=True,
+                            model=model,
+                        ),
+                    )
+                )
         sdk_manager = self.sdk_manager
-        if self.config.use_sdk and sdk_manager:
+        if self.config.use_sdk and sdk_manager and cli_kind != "codex":
             probe_runners.append(
                 (
                     "sdk",
@@ -845,6 +860,10 @@ class ClaudeIntegration:
         """Parse used/total token usage from /context output text."""
         if not text:
             return None
+
+        codex_status_payload = cls._parse_codex_status_text(text)
+        if codex_status_payload:
+            return codex_status_payload
 
         numeric = r"\d[\d,._]*(?:\.\d+)?\s*[kKmMbB]?"
         pair_pattern = re.compile(rf"(?P<used>{numeric})\s*/\s*(?P<total>{numeric})")
@@ -952,6 +971,106 @@ class ClaudeIntegration:
                 return payload
 
         return None
+
+    @classmethod
+    def _parse_codex_status_text(cls, text: str) -> Optional[Dict[str, Any]]:
+        """Parse interactive Codex `/status` status-box output."""
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+
+        context_match = re.search(
+            r"Context window:\s*"
+            r"(?P<left>\d{1,3}(?:\.\d+)?)%\s+left\s*"
+            r"\((?P<used>[\d,._]+(?:\.\d+)?\s*[kKmMbB]?)\s+used\s*/\s*"
+            r"(?P<total>[\d,._]+(?:\.\d+)?\s*[kKmMbB]?)\)",
+            normalized,
+            re.IGNORECASE,
+        )
+        if not context_match:
+            return None
+
+        used_tokens = cls._parse_token_number(context_match.group("used"))
+        total_tokens = cls._parse_token_number(context_match.group("total"))
+        payload = cls._build_context_usage_payload(
+            text=text,
+            candidate=context_match.group(0),
+            used_tokens=used_tokens,
+            total_tokens=total_tokens,
+            percent_pattern=re.compile(r"(?P<pct>\d{1,3}(?:\.\d+)?)\s*%"),
+            remaining_pattern=re.compile(
+                r"(?P<remaining>\d[\d,._]*(?:\.\d+)?\s*[kKmMbB]?)\s+left",
+                re.IGNORECASE,
+            ),
+            remaining_tokens_override=(
+                max((total_tokens or 0) - (used_tokens or 0), 0)
+                if used_tokens is not None and total_tokens is not None
+                else None
+            ),
+        )
+        if not payload:
+            return None
+        if used_tokens is not None and total_tokens:
+            payload["used_percent"] = used_tokens / total_tokens * 100
+
+        rate_limits: Dict[str, Any] = {}
+        for label, key, minutes in (
+            ("5h limit", "primary", 300),
+            ("Weekly limit", "secondary", 10_080),
+        ):
+            entry = cls._parse_codex_status_limit_line(
+                normalized,
+                label=label,
+                window_minutes=minutes,
+            )
+            if entry:
+                rate_limits[key] = entry
+        if rate_limits:
+            payload["rate_limits"] = rate_limits
+
+        model_match = re.search(
+            r"Model:\s*(?P<model>[^\s(]+)(?:\s+\(reasoning\s+"
+            r"(?P<effort>[^,()]+)[^)]*\))?",
+            normalized,
+            re.IGNORECASE,
+        )
+        if model_match:
+            model_name = str(model_match.group("model") or "").strip()
+            effort = str(model_match.group("effort") or "").strip()
+            if model_name:
+                payload["resolved_model"] = model_name
+            if effort:
+                payload["reasoning_effort"] = effort
+
+        return payload
+
+    @staticmethod
+    def _parse_codex_status_limit_line(
+        text: str,
+        *,
+        label: str,
+        window_minutes: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Parse `5h limit` / `Weekly limit` lines from interactive Codex `/status`."""
+        match = re.search(
+            rf"{re.escape(label)}:\s*(?:\[[^\]]*\]\s*)?"
+            rf"(?P<left>\d{{1,3}}(?:\.\d+)?)%\s+left"
+            rf"(?:\s*\(resets\s+(?P<reset>[^)]+)\))?",
+            text,
+            re.IGNORECASE,
+        )
+        if not match:
+            return None
+        try:
+            remaining_percent = float(match.group("left"))
+        except (TypeError, ValueError):
+            return None
+        entry: Dict[str, Any] = {
+            "used_percent": max(min(100.0 - remaining_percent, 100.0), 0.0),
+            "window_minutes": window_minutes,
+        }
+        reset_text = str(match.group("reset") or "").strip()
+        if reset_text:
+            entry["resets_at_text"] = reset_text
+        return entry
 
     @classmethod
     def _build_context_usage_payload(
