@@ -976,7 +976,8 @@ def test_build_session_context_summary_prefers_explicit_remaining_tokens():
     assert "used" not in summary
 
 
-def test_resolve_codex_context_snapshot_reads_cached_session_usage():
+@pytest.mark.asyncio
+async def test_resolve_codex_context_snapshot_reads_cached_session_usage():
     """Collapsed/status tags should reuse the latest cached Codex snapshot."""
     session_id = "session-codex-cached"
     SessionService._codex_snapshot_cache[session_id] = (
@@ -995,7 +996,7 @@ def test_resolve_codex_context_snapshot_reads_cached_session_usage():
 
     try:
         snapshot, session_summary, rate_limit_summary = (
-            _resolve_codex_context_snapshot(
+            await _resolve_codex_context_snapshot(
                 active_engine=ENGINE_CODEX,
                 session_id=session_id,
             )
@@ -1011,15 +1012,14 @@ def test_resolve_codex_context_snapshot_reads_cached_session_usage():
     assert "7d window: 63.0% remaining" in rate_limit_summary
 
 
-def test_resolve_codex_context_snapshot_falls_back_to_local_probe(monkeypatch):
-    """Collapsed/status tags should probe local Codex snapshot when cache is empty."""
+@pytest.mark.asyncio
+async def test_resolve_codex_context_snapshot_prefers_live_probe(monkeypatch):
+    """Collapsed/status tags should prefer live `/status` data for accuracy."""
     session_id = "session-codex-probe"
     SessionService._codex_snapshot_cache.clear()
-    monkeypatch.setattr(
-        SessionService,
-        "resolve_codex_snapshot",
-        classmethod(
-            lambda cls, sid: {
+    cli_integration = SimpleNamespace(
+        get_precise_context_usage=AsyncMock(
+            return_value={
                 "used_percent": 41.5,
                 "total_tokens": 258_000,
                 "remaining_tokens": 150_930,
@@ -1031,20 +1031,61 @@ def test_resolve_codex_context_snapshot_falls_back_to_local_probe(monkeypatch):
                     }
                 },
             }
-            if sid == session_id
-            else None
-        ),
+        )
+    )
+    monkeypatch.setattr(
+        SessionService,
+        "resolve_codex_snapshot",
+        classmethod(lambda cls, sid: None),
     )
 
-    snapshot, session_summary, rate_limit_summary = _resolve_codex_context_snapshot(
+    snapshot, session_summary, rate_limit_summary = await _resolve_codex_context_snapshot(
         active_engine=ENGINE_CODEX,
         session_id=session_id,
+        cli_integration=cli_integration,
+        working_directory=Path("/tmp/project"),
+        current_model="gpt-5.4",
     )
 
     assert snapshot is not None
     assert session_summary == "🔋 Session context: `58.5%` remaining"
     assert rate_limit_summary is not None
     assert "5h window: 58.0% remaining" in rate_limit_summary
+    cli_integration.get_precise_context_usage.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_resolve_codex_context_snapshot_falls_back_to_local_probe(monkeypatch):
+    """Collapsed/status tags should use local session snapshot when live probe fails."""
+    session_id = "session-codex-fallback"
+    SessionService._codex_snapshot_cache.clear()
+    cli_integration = SimpleNamespace(
+        get_precise_context_usage=AsyncMock(side_effect=RuntimeError("probe failed"))
+    )
+    monkeypatch.setattr(
+        SessionService,
+        "resolve_codex_snapshot",
+        classmethod(
+            lambda cls, sid: {
+                "used_percent": 25.0,
+                "total_tokens": 200_000,
+                "remaining_tokens": 150_000,
+            }
+            if sid == session_id
+            else None
+        ),
+    )
+
+    snapshot, session_summary, rate_limit_summary = await _resolve_codex_context_snapshot(
+        active_engine=ENGINE_CODEX,
+        session_id=session_id,
+        cli_integration=cli_integration,
+        working_directory=Path("/tmp/project"),
+    )
+
+    assert snapshot is not None
+    assert session_summary == "🔋 Session context: `75.0%` remaining"
+    assert rate_limit_summary is None
 
 
 def test_build_collapsed_thinking_summary_keeps_model_and_context():

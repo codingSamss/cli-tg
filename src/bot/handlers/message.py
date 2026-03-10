@@ -51,6 +51,7 @@ logger = structlog.get_logger()
 _IMAGE_STATUS_TOTAL_STEPS = 6
 _TELEGRAM_MESSAGE_LIMIT = 4096
 _TELEGRAM_SAFE_SPLIT_LIMIT = 3900
+_SUMMARY_CONTEXT_PROBE_TIMEOUT_SECONDS = 8.0
 _REACTION_FEEDBACK_STATE_KEY = "pending_reaction_feedback"
 _REACTION_COUNT_CACHE_KEY = "reaction_count_cache"
 _REACTION_UPDATE_DEDUP_KEY = "reaction_update_dedup"
@@ -2176,12 +2177,15 @@ def _build_session_context_summary(snapshot: Optional[dict[str, Any]]) -> Option
     return "🔋 Session context: " f"`{remaining_percent:.1f}%` remaining"
 
 
-def _resolve_codex_context_snapshot(
+async def _resolve_codex_context_snapshot(
     *,
     active_engine: str | None,
     session_id: Optional[str],
+    cli_integration: Any | None = None,
+    working_directory: Optional[Path] = None,
+    current_model: Optional[str] = None,
 ) -> tuple[Optional[dict[str, Any]], Optional[str], Optional[str]]:
-    """Resolve cached Codex snapshot and compact summary lines for UI tags."""
+    """Resolve Codex context snapshot, preferring a live status probe."""
     if normalize_cli_engine(active_engine) != ENGINE_CODEX:
         return None, None, None
 
@@ -2189,7 +2193,48 @@ def _resolve_codex_context_snapshot(
     if not sid:
         return None, None, None
 
-    snapshot = SessionService.resolve_codex_snapshot(sid)
+    snapshot: Optional[dict[str, Any]] = None
+    get_precise_context_usage = getattr(
+        cli_integration, "get_precise_context_usage", None
+    )
+    if callable(get_precise_context_usage) and isinstance(working_directory, Path):
+        probe_kwargs: dict[str, Any] = {
+            "session_id": sid,
+            "working_directory": working_directory,
+            "model": current_model,
+        }
+        try:
+            try:
+                snapshot = await asyncio.wait_for(
+                    get_precise_context_usage(
+                        **probe_kwargs,
+                        force_refresh=True,
+                    ),
+                    timeout=_SUMMARY_CONTEXT_PROBE_TIMEOUT_SECONDS,
+                )
+            except TypeError:
+                snapshot = await asyncio.wait_for(
+                    get_precise_context_usage(**probe_kwargs),
+                    timeout=_SUMMARY_CONTEXT_PROBE_TIMEOUT_SECONDS,
+                )
+        except asyncio.TimeoutError:
+            logger.info(
+                "Live Codex context probe timed out; falling back to local snapshot",
+                session_id=sid,
+                timeout_seconds=_SUMMARY_CONTEXT_PROBE_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            logger.info(
+                "Live Codex context probe failed; falling back to local snapshot",
+                session_id=sid,
+                error=str(exc),
+            )
+
+        if isinstance(snapshot, dict):
+            SessionService.cache_codex_snapshot(sid, snapshot)
+
+    if not isinstance(snapshot, dict):
+        snapshot = SessionService.resolve_codex_snapshot(sid)
     if not isinstance(snapshot, dict):
         return None, None, None
 
@@ -3204,9 +3249,14 @@ async def handle_text_message(
 
         # Build context tag for display in thinking summary or reply header
         codex_snapshot, session_context_summary, rate_limit_summary = (
-            _resolve_codex_context_snapshot(
+            await _resolve_codex_context_snapshot(
                 active_engine=active_engine,
                 session_id=scope_state.get("claude_session_id"),
+                cli_integration=cli_integration,
+                working_directory=Path(
+                    scope_state.get("current_directory", settings.approved_directory)
+                ),
+                current_model=scope_state.get("claude_model"),
             )
         )
         context_tag = _build_context_tag(
@@ -3739,9 +3789,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
             # Build context tag for CLI mode reply header
             _, cli_session_context_summary, cli_rate_limit_summary = (
-                _resolve_codex_context_snapshot(
+                await _resolve_codex_context_snapshot(
                     active_engine=active_engine,
                     session_id=scope_state.get("claude_session_id"),
+                    cli_integration=cli_integration,
+                    working_directory=Path(
+                        scope_state.get(
+                            "current_directory", settings.approved_directory
+                        )
+                    ),
+                    current_model=scope_state.get("claude_model"),
                 )
             )
             cli_context_tag = _build_context_tag(
@@ -4433,9 +4490,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
                 # Build context tag for image response
                 img_codex_snapshot, img_session_context_summary, img_rate_limit_summary = (
-                    _resolve_codex_context_snapshot(
+                    await _resolve_codex_context_snapshot(
                         active_engine=active_engine,
                         session_id=scope_state.get("claude_session_id"),
+                        cli_integration=cli_integration,
+                        working_directory=Path(
+                            scope_state.get(
+                                "current_directory", settings.approved_directory
+                            )
+                        ),
+                        current_model=scope_state.get("claude_model"),
                     )
                 )
                 img_context_tag = _build_context_tag(

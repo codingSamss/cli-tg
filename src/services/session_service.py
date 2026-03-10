@@ -396,6 +396,18 @@ class SessionService:
 
         return cls._probe_codex_session_snapshot(sid)
 
+    @classmethod
+    def cache_codex_snapshot(
+        cls,
+        session_id: str,
+        snapshot: Mapping[str, Any],
+    ) -> None:
+        """Store a normalized Codex snapshot in the short-lived in-memory cache."""
+        sid = str(session_id or "").strip()
+        if not sid or not isinstance(snapshot, Mapping):
+            return
+        cls._codex_snapshot_cache[sid] = (time.monotonic(), dict(snapshot))
+
     @staticmethod
     def _parse_codex_rate_limits(
         payload: Any,

@@ -389,6 +389,21 @@ def test_resolve_codex_snapshot_falls_back_to_local_probe(monkeypatch):
     assert resolved == expected_snapshot
 
 
+def test_cache_codex_snapshot_writes_short_lived_entry():
+    """Caching a resolved snapshot should update the in-memory Codex cache."""
+    session_id = "rate-limit-cache-write"
+    SessionService._codex_snapshot_cache.clear()
+
+    SessionService.cache_codex_snapshot(
+        session_id,
+        {"used_tokens": 12, "total_tokens": 100, "used_percent": 12.0},
+    )
+
+    cached = SessionService.get_cached_codex_snapshot(session_id)
+    assert cached is not None
+    assert cached["used_tokens"] == 12
+
+
 def test_parse_codex_rate_limits_extracts_primary_secondary():
     """Codex rate_limits payload should be normalized for status rendering."""
     parsed = SessionService._parse_codex_rate_limits(
