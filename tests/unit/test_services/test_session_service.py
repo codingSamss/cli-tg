@@ -373,6 +373,22 @@ def test_get_cached_codex_snapshot_respects_ttl(monkeypatch):
     assert expired is None
 
 
+def test_resolve_codex_snapshot_falls_back_to_local_probe(monkeypatch):
+    """Codex snapshot resolver should read local session data when cache misses."""
+    session_id = "rate-limit-probe"
+    expected_snapshot = {"used_tokens": 1234, "resolved_model": "gpt-5.4"}
+    SessionService._codex_snapshot_cache.clear()
+    monkeypatch.setattr(
+        SessionService,
+        "_probe_codex_session_snapshot",
+        staticmethod(lambda sid: expected_snapshot if sid == session_id else None),
+    )
+
+    resolved = SessionService.resolve_codex_snapshot(session_id)
+
+    assert resolved == expected_snapshot
+
+
 def test_parse_codex_rate_limits_extracts_primary_secondary():
     """Codex rate_limits payload should be normalized for status rendering."""
     parsed = SessionService._parse_codex_rate_limits(

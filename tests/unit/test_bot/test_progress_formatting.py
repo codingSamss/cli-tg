@@ -1011,6 +1011,42 @@ def test_resolve_codex_context_snapshot_reads_cached_session_usage():
     assert "7d window: 63.0% remaining" in rate_limit_summary
 
 
+def test_resolve_codex_context_snapshot_falls_back_to_local_probe(monkeypatch):
+    """Collapsed/status tags should probe local Codex snapshot when cache is empty."""
+    session_id = "session-codex-probe"
+    SessionService._codex_snapshot_cache.clear()
+    monkeypatch.setattr(
+        SessionService,
+        "resolve_codex_snapshot",
+        classmethod(
+            lambda cls, sid: {
+                "used_percent": 41.5,
+                "total_tokens": 258_000,
+                "remaining_tokens": 150_930,
+                "rate_limits": {
+                    "primary": {
+                        "used_percent": 42.0,
+                        "window_minutes": 300,
+                        "resets_at_text": "03:16",
+                    }
+                },
+            }
+            if sid == session_id
+            else None
+        ),
+    )
+
+    snapshot, session_summary, rate_limit_summary = _resolve_codex_context_snapshot(
+        active_engine=ENGINE_CODEX,
+        session_id=session_id,
+    )
+
+    assert snapshot is not None
+    assert session_summary == "🔋 Session context: `58.5%` remaining"
+    assert rate_limit_summary is not None
+    assert "5h window: 58.0% remaining" in rate_limit_summary
+
+
 def test_build_collapsed_thinking_summary_keeps_model_and_context():
     """Collapsed thinking summary should keep model line and append context info."""
     collapsed = _build_collapsed_thinking_summary(

@@ -2189,7 +2189,7 @@ def _resolve_codex_context_snapshot(
     if not sid:
         return None, None, None
 
-    snapshot = SessionService.get_cached_codex_snapshot(sid)
+    snapshot = SessionService.resolve_codex_snapshot(sid)
     if not isinstance(snapshot, dict):
         return None, None, None
 

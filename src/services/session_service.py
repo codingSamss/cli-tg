@@ -383,6 +383,19 @@ class SessionService:
             return None
         return dict(snapshot)
 
+    @classmethod
+    def resolve_codex_snapshot(cls, session_id: str) -> Optional[Dict[str, Any]]:
+        """Return a recent Codex snapshot, probing local session data on cache miss."""
+        sid = str(session_id or "").strip()
+        if not sid:
+            return None
+
+        cached_snapshot = cls.get_cached_codex_snapshot(sid)
+        if isinstance(cached_snapshot, dict):
+            return cached_snapshot
+
+        return cls._probe_codex_session_snapshot(sid)
+
     @staticmethod
     def _parse_codex_rate_limits(
         payload: Any,
