@@ -1,6 +1,7 @@
 """Tests for Claude subprocess integration parsing behavior."""
 
 import asyncio
+import signal
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -336,7 +337,7 @@ async def test_probe_codex_status_command_uses_interactive_resume(
     tmp_path, monkeypatch
 ):
     """Codex status probe should use interactive `resume`, not `exec resume`."""
-    manager = _build_manager(tmp_path, codex_enable_mcp=False)
+    manager = _build_manager(tmp_path, codex_enable_mcp=True)
     monkeypatch.setattr(
         "src.claude.sdk_integration.find_claude_cli",
         lambda _: "/usr/local/bin/codex",
@@ -367,6 +368,58 @@ async def test_probe_codex_status_command_uses_interactive_resume(
         "--no-alt-screen",
     ]
     assert captured["slash_command"] == "/status"
+
+
+@pytest.mark.asyncio
+async def test_start_process_uses_start_new_session(tmp_path, monkeypatch):
+    """Managed subprocesses should run in a dedicated process group."""
+    manager = _build_manager(tmp_path)
+    captured = {}
+    expected = object()
+
+    async def _fake_create_subprocess_exec(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return expected
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+
+    process = await manager._start_process(["codex", "exec"], tmp_path)
+
+    assert process is expected
+    assert captured["kwargs"]["start_new_session"] is True
+    assert captured["kwargs"]["cwd"] == str(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_terminate_process_tree_kills_process_group(tmp_path, monkeypatch):
+    """Cleanup should target the whole process group, not only the wrapper PID."""
+    manager = _build_manager(tmp_path)
+    calls = []
+
+    class _FakeProcess:
+        pid = 43210
+
+        def __init__(self):
+            self._wait_calls = 0
+
+        async def wait(self):
+            self._wait_calls += 1
+            if self._wait_calls == 1:
+                raise asyncio.TimeoutError
+            return None
+
+    def _fake_killpg(pid, sig):
+        calls.append((pid, sig))
+
+    monkeypatch.setattr("src.claude.integration.os.killpg", _fake_killpg)
+
+    await manager._terminate_process_tree(_FakeProcess())
+
+    assert calls == [
+        (43210, signal.SIGINT),
+        (43210, signal.SIGKILL),
+    ]
 
 
 def test_extract_codex_status_snapshot_keeps_stable_status_lines(tmp_path):

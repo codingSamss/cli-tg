@@ -13,6 +13,7 @@ import os
 import pty
 import re
 import select
+import signal
 import uuid
 from asyncio.subprocess import Process
 from collections import deque
@@ -148,7 +149,9 @@ class ProcessOutputDiagnostics:
 
     def mark_result(self, *, current_at: float) -> None:
         """Track when the final result/turn completion arrived on stdout."""
-        self.result_received_ms = _elapsed_ms(self.process_started_monotonic, current_at)
+        self.result_received_ms = _elapsed_ms(
+            self.process_started_monotonic, current_at
+        )
 
     def to_log_fields(self, *, process_wall_ms: int) -> Dict[str, Any]:
         """Render diagnostics as structured log fields."""
@@ -188,6 +191,60 @@ class ClaudeProcessManager:
         self.streaming_buffer_size = (
             65536  # 64KB streaming buffer for large JSON messages
         )
+
+    async def _terminate_process_tree(
+        self,
+        process: Process,
+        *,
+        graceful_signal: signal.Signals = signal.SIGINT,
+        wait_timeout_seconds: float = 3.0,
+    ) -> None:
+        """Terminate a managed subprocess and its children safely.
+
+        Codex CLI installed from npm is a Node wrapper that spawns the native
+        binary. If we only kill the wrapper, the native `codex` child (and MCP
+        children it launched) can survive as orphan processes. Run managed
+        subprocesses in their own session and always signal the full process
+        group here.
+        """
+        pid = getattr(process, "pid", None)
+        if pid is None:
+            return
+
+        try:
+            os.killpg(pid, graceful_signal)
+        except ProcessLookupError:
+            return
+        except Exception:
+            # Fallback for platforms/processes where group signaling is not available.
+            try:
+                process.send_signal(graceful_signal)
+            except ProcessLookupError:
+                return
+            except Exception:
+                pass
+
+        try:
+            await asyncio.wait_for(
+                process.wait(), timeout=max(wait_timeout_seconds, 0.1)
+            )
+            return
+        except asyncio.TimeoutError:
+            pass
+
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        except Exception:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                return
+            except Exception:
+                pass
+
+        await process.wait()
 
     async def execute_command(
         self,
@@ -259,8 +316,7 @@ class ClaudeProcessManager:
         except asyncio.TimeoutError:
             # Kill process on timeout
             if process_id in self.active_processes:
-                self.active_processes[process_id].kill()
-                await self.active_processes[process_id].wait()
+                await self._terminate_process_tree(self.active_processes[process_id])
 
             logger.error(
                 "Claude Code process timed out",
@@ -509,6 +565,7 @@ class ClaudeProcessManager:
             stderr=asyncio.subprocess.PIPE,
             cwd=str(cwd),
             env=env,
+            start_new_session=True,
             # Limit memory usage
             limit=1024 * 1024 * 512,  # 512MB
         )
@@ -534,8 +591,9 @@ class ClaudeProcessManager:
             )
 
         cmd = [cli_path]
-        if not self.config.codex_enable_mcp:
-            cmd.extend(["-c", "mcp_servers={}"])
+        # Status probe only needs core session metadata. Disable MCP here so a
+        # lightweight `/status` sample does not eagerly spawn heavy MCP trees.
+        cmd.extend(["-c", "mcp_servers={}"])
         cmd.extend(["resume", normalized_session_id, "--no-alt-screen"])
 
         started_at = asyncio.get_event_loop().time()
@@ -584,6 +642,7 @@ class ClaudeProcessManager:
                 stderr=slave_fd,
                 cwd=str(working_directory),
                 env=env,
+                start_new_session=True,
             )
         finally:
             os.close(slave_fd)
@@ -632,11 +691,11 @@ class ClaudeProcessManager:
                 pass
 
             if process is not None:
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=3)
-                except asyncio.TimeoutError:
-                    process.kill()
-                    await process.wait()
+                await self._terminate_process_tree(
+                    process,
+                    graceful_signal=signal.SIGINT,
+                    wait_timeout_seconds=3,
+                )
             os.close(master_fd)
 
     @staticmethod
@@ -789,9 +848,7 @@ class ClaudeProcessManager:
                     and msg_type in {"turn.completed", "turn.failed"}
                 ):
                     result = msg
-                    diagnostics.mark_result(
-                        current_at=asyncio.get_event_loop().time()
-                    )
+                    diagnostics.mark_result(current_at=asyncio.get_event_loop().time())
 
             except json.JSONDecodeError as e:
                 parsing_errors.append(f"JSON decode error: {e}")
@@ -814,9 +871,7 @@ class ClaudeProcessManager:
             "Claude subprocess output diagnostics",
             cli_kind=cli_kind,
             return_code=return_code,
-            **diagnostics.to_log_fields(
-                process_wall_ms=_elapsed_ms(started_at)
-            ),
+            **diagnostics.to_log_fields(process_wall_ms=_elapsed_ms(started_at)),
         )
 
         if return_code != 0:
@@ -1601,8 +1656,7 @@ class ClaudeProcessManager:
 
         for process_id, process in self.active_processes.items():
             try:
-                process.kill()
-                await process.wait()
+                await self._terminate_process_tree(process)
                 logger.info("Killed Claude process", process_id=process_id)
             except Exception as e:
                 logger.warning(
