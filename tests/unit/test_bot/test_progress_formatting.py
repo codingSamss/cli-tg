@@ -22,6 +22,7 @@ from src.bot.handlers.message import (
     _is_high_priority_stream_update,
     _is_markdown_parse_error,
     _is_noop_edit_error,
+    _should_collect_thinking_update,
     _is_turn_started_update,
     _join_progress_lines_for_display,
     _reply_text_resilient,
@@ -561,6 +562,38 @@ def test_get_stream_merge_key_for_mergeable_events():
     assert _get_stream_merge_key(assistant_update) == "assistant_content"
     assert _get_stream_merge_key(progress_update) == "progress"
     assert _get_stream_merge_key(tool_update) is None
+
+
+def test_should_collect_thinking_update_keeps_only_assistant_content():
+    """Thinking details should keep assistant narration only."""
+    assistant_text = _FakeUpdate(
+        type="assistant",
+        content="draft answer",
+        tool_calls=None,
+    )
+    assistant_empty = _FakeUpdate(type="assistant", content="   ", tool_calls=None)
+    assistant_tool = _FakeUpdate(
+        type="assistant",
+        content="tool call",
+        tool_calls=[{"name": "Read"}],
+    )
+    progress_update = _FakeUpdate(type="progress", content="working")
+    command_progress = _FakeUpdate(
+        type="progress",
+        metadata={"item_type": "command_execution", "status": "in_progress"},
+        content="/bin/zsh -lc 'pwd'",
+    )
+    system_update = _FakeUpdate(
+        type="system",
+        metadata={"subtype": "model_resolved"},
+    )
+
+    assert _should_collect_thinking_update(assistant_text) is True
+    assert _should_collect_thinking_update(assistant_empty) is False
+    assert _should_collect_thinking_update(assistant_tool) is False
+    assert _should_collect_thinking_update(progress_update) is False
+    assert _should_collect_thinking_update(command_progress) is False
+    assert _should_collect_thinking_update(system_update) is False
 
 
 def test_get_stream_merge_key_for_command_execution_uses_command_identity():

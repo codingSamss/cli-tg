@@ -2011,6 +2011,16 @@ def _get_stream_merge_key(update_obj: Any) -> Optional[str]:
     return None
 
 
+def _should_collect_thinking_update(update_obj: Any) -> bool:
+    """Whether this stream update should appear in expandable thinking details."""
+    if getattr(update_obj, "type", None) != "assistant":
+        return False
+    if getattr(update_obj, "tool_calls", None):
+        return False
+    content = str(getattr(update_obj, "content", "") or "").strip()
+    return bool(content)
+
+
 def _is_turn_started_update(update_obj: Any) -> bool:
     """Whether stream update is a progress turn.started marker."""
     if update_obj.type != "progress":
@@ -2963,12 +2973,8 @@ async def handle_text_message(
                     progress_text=progress_text,
                     merge_key=merge_key,
                 )
-                # Only collect non-content updates as thinking process
-                if not (
-                    update_obj.type == "assistant"
-                    and update_obj.content
-                    and not update_obj.tool_calls
-                ):
+                # Keep expandable thinking focused on assistant narration only.
+                if _should_collect_thinking_update(update_obj):
                     _append_progress_line_with_merge(
                         progress_lines=all_progress_lines,
                         progress_merge_keys=all_progress_merge_keys,
@@ -4203,13 +4209,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                         return
                     pending_stream_text = full_text
 
-                    # Keep behavior aligned with text flow:
-                    # assistant plain content is not part of thinking details.
-                    if not (
-                        update_obj.type == "assistant"
-                        and update_obj.content
-                        and not update_obj.tool_calls
-                    ):
+                    # Keep behavior aligned with text flow and only cache
+                    # assistant narration for expandable thinking details.
+                    if _should_collect_thinking_update(update_obj):
                         _append_progress_line_with_merge(
                             progress_lines=thinking_lines,
                             progress_merge_keys=thinking_merge_keys,
