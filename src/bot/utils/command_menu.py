@@ -27,6 +27,7 @@ COMMAND_MENU_SPECS: tuple[MenuCommandSpec, ...] = (
     MenuCommandSpec("cancel", "Cancel the current running task"),
     MenuCommandSpec("queue", "Show queued tasks"),
     MenuCommandSpec("dequeue", "Remove a queued task by ID"),
+    MenuCommandSpec("cron", "Manage reminders and cron jobs"),
     MenuCommandSpec("model", "View or set model"),
     MenuCommandSpec("codexdiag", "Diagnose Codex MCP status (Codex)"),
     MenuCommandSpec("projects", "Show all projects"),

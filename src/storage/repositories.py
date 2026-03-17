@@ -16,6 +16,8 @@ from .database import DatabaseManager
 from .models import (
     AuditLogModel,
     CostTrackingModel,
+    CronJobModel,
+    CronRunModel,
     MessageModel,
     SessionEventModel,
     SessionModel,
@@ -662,6 +664,228 @@ class ApprovalRequestRepository:
             )
             await conn.commit()
             return cursor.rowcount
+
+
+class CronJobRepository:
+    """Cron job data access."""
+
+    def __init__(self, db_manager: DatabaseManager):
+        self.db = db_manager
+
+    async def create_job(self, job: CronJobModel) -> CronJobModel:
+        """Persist one cron job and return model with generated id."""
+        now = datetime.utcnow()
+        async with self.db.get_connection() as conn:
+            cursor = await conn.execute(
+                """
+                INSERT INTO cron_jobs (
+                    user_id, job_type, schedule_type, cron_expr, run_at,
+                    payload_text, engine, chat_id, thread_id, scope_key, project_dir,
+                    session_id, status, fail_count, last_error,
+                    last_run_at, next_run_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job.user_id,
+                    job.job_type,
+                    job.schedule_type,
+                    job.cron_expr,
+                    job.run_at,
+                    job.payload_text,
+                    job.engine,
+                    job.chat_id,
+                    job.thread_id,
+                    job.scope_key,
+                    job.project_dir,
+                    job.session_id,
+                    job.status,
+                    job.fail_count,
+                    job.last_error,
+                    job.last_run_at,
+                    job.next_run_at,
+                    job.created_at or now,
+                    job.updated_at or now,
+                ),
+            )
+            await conn.commit()
+            job.id = _require_lastrowid(cursor.lastrowid)
+            if not job.created_at:
+                job.created_at = now
+            if not job.updated_at:
+                job.updated_at = now
+            return job
+
+    async def get_job(
+        self, job_id: int, *, user_id: Optional[int] = None
+    ) -> Optional[CronJobModel]:
+        """Get job by id."""
+        query = "SELECT * FROM cron_jobs WHERE id = ?"
+        params: list[Any] = [job_id]
+        if user_id is not None:
+            query += " AND user_id = ?"
+            params.append(user_id)
+        async with self.db.get_connection() as conn:
+            cursor = await conn.execute(query, params)
+            row = await cursor.fetchone()
+            return CronJobModel.from_row(row) if row else None
+
+    async def list_jobs(
+        self, *, user_id: int, include_inactive: bool = True
+    ) -> List[CronJobModel]:
+        """List jobs for one user."""
+        query = "SELECT * FROM cron_jobs WHERE user_id = ?"
+        params: list[Any] = [user_id]
+        if not include_inactive:
+            query += " AND status = 'enabled'"
+        query += " ORDER BY created_at DESC, id DESC"
+        async with self.db.get_connection() as conn:
+            cursor = await conn.execute(query, params)
+            rows = await cursor.fetchall()
+            return [CronJobModel.from_row(row) for row in rows]
+
+    async def count_user_active_jobs(self, *, user_id: int) -> int:
+        """Count enabled/paused jobs for one user."""
+        async with self.db.get_connection() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT COUNT(*) FROM cron_jobs
+                WHERE user_id = ?
+                  AND status IN ('enabled', 'paused')
+                """,
+                (user_id,),
+            )
+            row = await cursor.fetchone()
+            return int(row[0]) if row else 0
+
+    async def list_enabled_jobs(self) -> List[CronJobModel]:
+        """List enabled jobs for scheduler bootstrap."""
+        async with self.db.get_connection() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT * FROM cron_jobs
+                WHERE status = 'enabled'
+                ORDER BY next_run_at ASC, id ASC
+                """
+            )
+            rows = await cursor.fetchall()
+            return [CronJobModel.from_row(row) for row in rows]
+
+    async def set_status(
+        self,
+        *,
+        job_id: int,
+        status: str,
+        user_id: Optional[int] = None,
+        next_run_at: Optional[datetime] = None,
+        last_error: Optional[str] = None,
+    ) -> bool:
+        """Update job status and metadata."""
+        query = """
+            UPDATE cron_jobs
+            SET status = ?, next_run_at = ?, last_error = ?, updated_at = ?
+            WHERE id = ?
+        """
+        params: list[Any] = [status, next_run_at, last_error, datetime.utcnow(), job_id]
+        if user_id is not None:
+            query += " AND user_id = ?"
+            params.append(user_id)
+        async with self.db.get_connection() as conn:
+            cursor = await conn.execute(query, params)
+            await conn.commit()
+            return cursor.rowcount > 0
+
+    async def update_runtime(
+        self,
+        *,
+        job_id: int,
+        last_run_at: Optional[datetime],
+        next_run_at: Optional[datetime],
+        fail_count: int,
+        last_error: Optional[str],
+        session_id: Optional[str] = None,
+    ) -> bool:
+        """Update runtime fields after one execution."""
+        async with self.db.get_connection() as conn:
+            cursor = await conn.execute(
+                """
+                UPDATE cron_jobs
+                SET last_run_at = ?,
+                    next_run_at = ?,
+                    fail_count = ?,
+                    last_error = ?,
+                    session_id = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    last_run_at,
+                    next_run_at,
+                    fail_count,
+                    last_error,
+                    session_id,
+                    datetime.utcnow(),
+                    job_id,
+                ),
+            )
+            await conn.commit()
+            return cursor.rowcount > 0
+
+    async def mark_deleted(self, *, job_id: int, user_id: int) -> bool:
+        """Soft-delete job."""
+        return await self.set_status(
+            job_id=job_id,
+            user_id=user_id,
+            status="deleted",
+            next_run_at=None,
+            last_error=None,
+        )
+
+
+class CronRunRepository:
+    """Cron execution run record access."""
+
+    def __init__(self, db_manager: DatabaseManager):
+        self.db = db_manager
+
+    async def create_run(self, run: CronRunModel) -> int:
+        """Persist one execution run and return run id."""
+        async with self.db.get_connection() as conn:
+            cursor = await conn.execute(
+                """
+                INSERT INTO cron_runs (
+                    job_id, user_id, started_at, finished_at, success,
+                    output_preview, error_message
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run.job_id,
+                    run.user_id,
+                    run.started_at,
+                    run.finished_at,
+                    run.success,
+                    run.output_preview,
+                    run.error_message,
+                ),
+            )
+            await conn.commit()
+            run_id = _require_lastrowid(cursor.lastrowid)
+            run.id = run_id
+            return run_id
+
+    async def list_runs(self, *, job_id: int, limit: int = 20) -> List[CronRunModel]:
+        """List run history for one job."""
+        async with self.db.get_connection() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT * FROM cron_runs
+                WHERE job_id = ?
+                ORDER BY started_at DESC, id DESC
+                LIMIT ?
+                """,
+                (job_id, limit),
+            )
+            rows = await cursor.fetchall()
+            return [CronRunModel.from_row(row) for row in rows]
 
 
 class CostTrackingRepository:

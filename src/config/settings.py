@@ -195,6 +195,32 @@ class Settings(BaseSettings):
         ge=5,
         le=300,
     )
+    cron_enabled: bool = Field(
+        True,
+        description="Enable cron/reminder scheduling features",
+    )
+    cron_max_jobs_per_user: int = Field(
+        5,
+        description="Maximum active cron/reminder jobs per user",
+        ge=1,
+        le=100,
+    )
+    cron_min_interval_minutes: int = Field(
+        15,
+        description="Minimum allowed interval for recurring cron jobs",
+        ge=1,
+        le=1440,
+    )
+    cron_nl_min_delay_seconds: int = Field(
+        60,
+        description="Minimum delay for natural-language one-shot reminders",
+        ge=10,
+        le=86400,
+    )
+    cron_timezone: str = Field(
+        "Asia/Shanghai",
+        description="Timezone used by cron/reminder scheduler",
+    )
 
     # Monitoring
     log_level: str = Field("INFO", description="Logging level")

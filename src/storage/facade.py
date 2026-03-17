@@ -23,6 +23,8 @@ from .repositories import (
     ApprovalRequestRepository,
     AuditLogRepository,
     CostTrackingRepository,
+    CronJobRepository,
+    CronRunRepository,
     MessageRepository,
     SessionEventRepository,
     SessionRepository,
@@ -46,6 +48,8 @@ class Storage:
         self.session_events = SessionEventRepository(self.db_manager)
         self.audit = AuditLogRepository(self.db_manager)
         self.approvals = ApprovalRequestRepository(self.db_manager)
+        self.cron_jobs = CronJobRepository(self.db_manager)
+        self.cron_runs = CronRunRepository(self.db_manager)
         self.costs = CostTrackingRepository(self.db_manager)
         self.analytics = AnalyticsRepository(self.db_manager)
 

@@ -8,7 +8,7 @@ import time
 from collections import Counter
 from collections.abc import MutableMapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Optional
@@ -23,6 +23,7 @@ from ...claude.task_registry import TaskRegistry
 from ...config.settings import Settings
 from ...security.audit import AuditLogger
 from ...security.validators import SecurityValidator
+from ...services.cron_scheduler_service import CronSchedulerService, CronValidationError
 from ...services.session_service import SessionService
 from ...utils.codex_rate_limits import format_rate_limit_summary
 from ..inbound_task_queue import InboundTaskQueue
@@ -146,9 +147,7 @@ _STATUS_REACTION_WEB_TOOL_TOKENS = (
 )
 
 
-def _elapsed_monotonic_ms(
-    started_at: float, current_at: Optional[float] = None
-) -> int:
+def _elapsed_monotonic_ms(started_at: float, current_at: Optional[float] = None) -> int:
     """Return non-negative milliseconds elapsed from a monotonic timestamp."""
     end_at = time.monotonic() if current_at is None else current_at
     return max(0, int((end_at - started_at) * 1000))
@@ -181,9 +180,7 @@ class _RequestTimingDiagnostics:
     def mark_stream_update(self, update_obj: Any) -> None:
         """Track first/last stream activity and tool-related progress."""
         current_at = time.monotonic()
-        elapsed_ms = _elapsed_monotonic_ms(
-            self.request_started_monotonic, current_at
-        )
+        elapsed_ms = _elapsed_monotonic_ms(self.request_started_monotonic, current_at)
         self.stream_update_count += 1
         if self.first_stream_update_ms is None:
             self.first_stream_update_ms = elapsed_ms
@@ -1500,10 +1497,7 @@ async def _dispatch_next_inbound_task(
         kind=queued_item.kind,
         queue_wait_ms=max(
             0,
-            int(
-                (datetime.now() - queued_item.created_at).total_seconds()
-                * 1000
-            ),
+            int((datetime.now() - queued_item.created_at).total_seconds() * 1000),
         ),
     )
     asyncio.create_task(_run_queued_task())
@@ -2690,6 +2684,54 @@ async def handle_text_message(
             merged_length=len(message_text),
             source_message_id=input_message_id,
         )
+
+    cron_scheduler = context.bot_data.get("cron_scheduler_service")
+    if isinstance(cron_scheduler, CronSchedulerService):
+        current_dir_raw = scope_state.get(
+            "current_directory", settings.approved_directory
+        )
+        current_dir = (
+            Path(current_dir_raw)
+            if isinstance(current_dir_raw, (str, Path))
+            else settings.approved_directory
+        )
+        try:
+            reminder_job = await cron_scheduler.create_natural_language_reminder(
+                text=message_text,
+                user_id=user_id,
+                chat_id=input_chat_id,
+                thread_id=int(getattr(telegram_message, "message_thread_id", 0) or 0),
+                scope_key=scope_key,
+                project_dir=current_dir,
+            )
+        except CronValidationError as exc:
+            await _reply_text_resilient(telegram_message, f"⚠️ {exc}")
+            return
+        if reminder_job is not None:
+            run_at = getattr(reminder_job, "run_at", None)
+            if isinstance(run_at, datetime):
+                run_at_local = (
+                    run_at.replace(tzinfo=timezone.utc)
+                    .astimezone(timezone(timedelta(hours=8), name="UTC+8"))
+                    .strftime("%Y-%m-%d %H:%M:%S")
+                )
+            else:
+                run_at_local = "unknown"
+            await _reply_text_resilient(
+                telegram_message,
+                (
+                    f"⏰ 已创建提醒 #{reminder_job.id}。\n"
+                    f"将在北京时间 {run_at_local} 提醒你：{reminder_job.payload_text}"
+                ),
+            )
+            if audit_logger:
+                await audit_logger.log_command(
+                    user_id=user_id,
+                    command="cron_nl",
+                    args=[str(reminder_job.id)],
+                    success=True,
+                )
+            return
 
     logger.info(
         "Processing text message", user_id=user_id, message_length=len(message_text)
@@ -4491,18 +4533,20 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 )
 
                 # Build context tag for image response
-                img_codex_snapshot, img_session_context_summary, img_rate_limit_summary = (
-                    await _resolve_codex_context_snapshot(
-                        active_engine=active_engine,
-                        session_id=scope_state.get("claude_session_id"),
-                        cli_integration=cli_integration,
-                        working_directory=Path(
-                            scope_state.get(
-                                "current_directory", settings.approved_directory
-                            )
-                        ),
-                        current_model=scope_state.get("claude_model"),
-                    )
+                (
+                    img_codex_snapshot,
+                    img_session_context_summary,
+                    img_rate_limit_summary,
+                ) = await _resolve_codex_context_snapshot(
+                    active_engine=active_engine,
+                    session_id=scope_state.get("claude_session_id"),
+                    cli_integration=cli_integration,
+                    working_directory=Path(
+                        scope_state.get(
+                            "current_directory", settings.approved_directory
+                        )
+                    ),
+                    current_model=scope_state.get("claude_model"),
                 )
                 img_context_tag = _build_context_tag(
                     scope_state=scope_state,

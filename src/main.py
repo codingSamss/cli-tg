@@ -36,6 +36,7 @@ from src.security.auth import (
 from src.security.validators import SecurityValidator
 from src.services import (
     ApprovalService,
+    CronSchedulerService,
     EventService,
     SessionInteractionService,
     SessionLifecycleService,
@@ -167,6 +168,12 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     session_interaction_service = SessionInteractionService()
     event_service = EventService(storage)
     session_service = SessionService(storage=storage, event_service=event_service)
+    cron_scheduler_service = CronSchedulerService(
+        settings=config,
+        cron_jobs=storage.cron_jobs,
+        cron_runs=storage.cron_runs,
+        audit_logger=audit_logger,
+    )
 
     # Create Claude manager based on configuration
     if config.use_sdk:
@@ -240,6 +247,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         "session_interaction_service": session_interaction_service,
         "event_service": event_service,
         "session_service": session_service,
+        "cron_scheduler_service": cron_scheduler_service,
         "cli_integrations": cli_integrations,
         "cc_switch_manager": cc_switch_manager,
     }

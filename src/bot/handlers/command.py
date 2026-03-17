@@ -2,6 +2,7 @@
 
 import asyncio
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
@@ -14,6 +15,12 @@ from ...claude.task_registry import TaskRegistry
 from ...config.settings import Settings
 from ...security.audit import AuditLogger
 from ...security.validators import SecurityValidator
+from ...services.cron_scheduler_service import (
+    CRON_JOB_TYPE_AI_PROMPT,
+    CRON_JOB_TYPE_REMINDER,
+    CronSchedulerService,
+    CronValidationError,
+)
 from ...services.session_interaction_service import SessionInteractionService
 from ...services.session_lifecycle_service import SessionLifecycleService
 from ...services.session_service import SessionService
@@ -34,8 +41,8 @@ from ..utils.recent_projects import build_recent_projects_message, scan_recent_p
 from ..utils.resume_ui import build_resume_project_selector
 from ..utils.scope_state import get_scope_state_from_update
 from ..utils.telegram_send import (
-    is_thread_not_found_error,
     is_markdown_parse_error,
+    is_thread_not_found_error,
     normalize_message_thread_id,
     prepare_telegram_text_and_parse_mode,
     send_message_resilient,
@@ -648,6 +655,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"• `/cancel` - Cancel current running task\n"
         f"• `/queue` - Show queued tasks\n"
         f"• `/dequeue <id>` - Remove one queued task\n"
+        f"• `/cron ...` - Manage reminders and scheduled jobs\n"
         f"• `/sendpic [path|url] [caption]` - Send latest/specified image\n"
         f"• `/git` - Git repository commands\n"
         f"{diagnostics_line}\n"
@@ -738,6 +746,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• `/cancel` - Cancel current running task\n"
         "• `/queue` - Show queued tasks\n"
         "• `/dequeue <id>` - Remove one queued task\n"
+        "• `/cron ...` - Manage reminders and scheduled jobs\n"
         "• `/sendpic [path|url] [caption]` - Send latest/specified image\n"
         f"{model_line}"
         "• `/export` - Export session history\n"
@@ -2239,6 +2248,197 @@ async def dequeue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             args=[str(queue_id)],
             success=success,
         )
+
+
+def _get_cron_scheduler(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> Optional[CronSchedulerService]:
+    scheduler = context.bot_data.get("cron_scheduler_service")
+    if isinstance(scheduler, CronSchedulerService):
+        return scheduler
+    return None
+
+
+def _render_cron_usage() -> str:
+    return (
+        "Cron usage:\n"
+        "• `/cron list`\n"
+        "• `/cron add reminder <cron_expr(5段)> <text>`\n"
+        "• `/cron add ai <engine> <cron_expr(5段)> <prompt>`\n"
+        "• `/cron pause <id>`\n"
+        "• `/cron resume <id>`\n"
+        "• `/cron delete <id>`\n\n"
+        "Examples:\n"
+        "• `/cron add reminder 0 9 * * 1-5 standup reminder`\n"
+        "• `/cron add ai claude 30 10 * * * summarize today's TODOs`\n"
+    )
+
+
+def _format_cron_time(
+    value: Optional[datetime], *, timezone_name: str = "Asia/Shanghai"
+) -> str:
+    if value is None:
+        return "-"
+    tz = timezone.utc
+    aware = value.replace(tzinfo=tz) if value.tzinfo is None else value.astimezone(tz)
+    # Use fixed UTC+8 display to avoid host timezone drift.
+    beijing = aware.astimezone(timezone(timedelta(hours=8), name="UTC+8"))
+    return f"{beijing.strftime('%Y-%m-%d %H:%M:%S')} ({timezone_name})"
+
+
+def _render_cron_job_line(job: Any) -> str:
+    job_id = getattr(job, "id", "?")
+    status = getattr(job, "status", "-")
+    job_type = getattr(job, "job_type", "-")
+    schedule_type = getattr(job, "schedule_type", "-")
+    payload_text = str(getattr(job, "payload_text", "") or "").strip()
+    if len(payload_text) > 50:
+        payload_text = payload_text[:50] + "..."
+    if schedule_type == "once":
+        when_text = _format_cron_time(getattr(job, "run_at", None))
+    else:
+        when_text = str(getattr(job, "cron_expr", "") or "-")
+    next_run = _format_cron_time(getattr(job, "next_run_at", None))
+    return (
+        f"#{job_id} [{status}] [{job_type}] {when_text}\n"
+        f"  next: {next_run}\n"
+        f"  text: {payload_text}"
+    )
+
+
+def _parse_cron_add_arguments(
+    raw_args: list[str],
+) -> tuple[str, Optional[str], str, str]:
+    """Parse `/cron add ...` args."""
+    if len(raw_args) < 7:
+        raise CronValidationError("参数不足，请参考 `/cron` 用法。")
+    task_type = str(raw_args[0]).strip().lower()
+    if task_type in {"reminder", "remind"}:
+        cron_expr = " ".join(raw_args[1:6]).strip()
+        payload = " ".join(raw_args[6:]).strip()
+        return CRON_JOB_TYPE_REMINDER, None, cron_expr, payload
+    if task_type == "ai":
+        if len(raw_args) < 8:
+            raise CronValidationError(
+                "AI 任务参数不足，请提供 engine + cron + prompt。"
+            )
+        engine = normalize_cli_engine(raw_args[1])
+        cron_expr = " ".join(raw_args[2:7]).strip()
+        payload = " ".join(raw_args[7:]).strip()
+        return CRON_JOB_TYPE_AI_PROMPT, engine, cron_expr, payload
+    raise CronValidationError("任务类型仅支持 reminder/remind 或 ai。")
+
+
+async def cron_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /cron command family."""
+    scheduler = _get_cron_scheduler(context)
+    if scheduler is None:
+        await _reply_update_message_resilient(
+            update, context, "Cron scheduler unavailable."
+        )
+        return
+
+    user_id = _require_effective_user(update).id
+    settings: Settings = context.bot_data["settings"]
+    scope_key, scope_state = get_scope_state_from_update(
+        user_data=context.user_data,
+        update=update,
+        default_directory=settings.approved_directory,
+    )
+    current_dir = scope_state.get("current_directory", settings.approved_directory)
+    project_dir = (
+        Path(current_dir)
+        if isinstance(current_dir, (str, Path))
+        else settings.approved_directory
+    )
+
+    args = [str(arg).strip() for arg in (context.args or []) if str(arg).strip()]
+    if not args:
+        await _reply_update_message_resilient(update, context, _render_cron_usage())
+        return
+
+    action = args[0].lower()
+    if action in {"help", "h"}:
+        await _reply_update_message_resilient(update, context, _render_cron_usage())
+        return
+
+    if action == "list":
+        jobs = await scheduler.list_user_jobs(user_id=user_id)
+        if not jobs:
+            await _reply_update_message_resilient(
+                update,
+                context,
+                "No cron jobs.\n\nUse natural language like `5分钟后提醒我拿奶茶` or `/cron add ...`.",
+                parse_mode="Markdown",
+            )
+            return
+        lines = ["Cron jobs:"]
+        for job in jobs:
+            lines.append(_render_cron_job_line(job))
+        await _reply_update_message_resilient(update, context, "\n".join(lines))
+        return
+
+    if action in {"pause", "resume", "delete"}:
+        if len(args) < 2:
+            await _reply_update_message_resilient(
+                update, context, f"Usage: `/cron {action} <id>`", parse_mode="Markdown"
+            )
+            return
+        job_id = _parse_queue_id(args[1])
+        if job_id is None:
+            await _reply_update_message_resilient(update, context, "Invalid cron id.")
+            return
+        if action == "pause":
+            changed = await scheduler.pause_job(user_id=user_id, job_id=job_id)
+        elif action == "resume":
+            changed = await scheduler.resume_job(user_id=user_id, job_id=job_id)
+        else:
+            changed = await scheduler.delete_job(user_id=user_id, job_id=job_id)
+
+        if changed:
+            await _set_update_message_reaction_safe(update, context, emoji="✅")
+        else:
+            await _reply_update_message_resilient(
+                update, context, f"Job #{job_id} not found or state invalid."
+            )
+        return
+
+    if action == "add":
+        try:
+            job_type, engine, cron_expr, payload = _parse_cron_add_arguments(args[1:])
+            if not payload:
+                raise CronValidationError("任务内容不能为空。")
+            chat = _require_effective_chat(update)
+            thread_id = getattr(
+                getattr(update, "effective_message", None), "message_thread_id", None
+            )
+            created = await scheduler.create_cron_job(
+                user_id=user_id,
+                chat_id=chat.id,
+                thread_id=int(thread_id or 0),
+                scope_key=scope_key,
+                project_dir=project_dir,
+                job_type=job_type,
+                cron_expr=cron_expr,
+                payload_text=payload,
+                engine=engine,
+            )
+        except CronValidationError as exc:
+            await _reply_update_message_resilient(update, context, f"❌ {exc}")
+            return
+
+        await _reply_update_message_resilient(
+            update,
+            context,
+            "✅ Cron job created\n\n"
+            f"ID: #{created.id}\n"
+            f"Type: {created.job_type}\n"
+            f"Schedule: {created.cron_expr}\n"
+            f"Next: {_format_cron_time(created.next_run_at)}",
+        )
+        return
+
+    await _reply_update_message_resilient(update, context, _render_cron_usage())
 
 
 def _split_text_chunks(text: str, max_chars: int = 3500) -> list[str]:

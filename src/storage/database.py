@@ -268,6 +268,59 @@ class DatabaseManager:
                     ON session_events(created_at);
                 """,
             ),
+            (
+                5,
+                """
+                -- Cron/reminder task persistence
+                CREATE TABLE IF NOT EXISTS cron_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    job_type TEXT NOT NULL CHECK (job_type IN ('reminder', 'ai_prompt')),
+                    schedule_type TEXT NOT NULL CHECK (schedule_type IN ('once', 'cron')),
+                    cron_expr TEXT,
+                    run_at TIMESTAMP,
+                    payload_text TEXT NOT NULL,
+                    engine TEXT,
+                    chat_id INTEGER NOT NULL,
+                    thread_id INTEGER NOT NULL DEFAULT 0,
+                    scope_key TEXT NOT NULL,
+                    project_dir TEXT NOT NULL,
+                    session_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'enabled'
+                        CHECK (status IN ('enabled', 'paused', 'completed', 'deleted')),
+                    fail_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    last_run_at TIMESTAMP,
+                    next_run_at TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_cron_jobs_user_status
+                    ON cron_jobs(user_id, status);
+                CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_run
+                    ON cron_jobs(next_run_at);
+                CREATE INDEX IF NOT EXISTS idx_cron_jobs_scope
+                    ON cron_jobs(scope_key);
+
+                CREATE TABLE IF NOT EXISTS cron_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    started_at TIMESTAMP NOT NULL,
+                    finished_at TIMESTAMP,
+                    success BOOLEAN NOT NULL,
+                    output_preview TEXT,
+                    error_message TEXT,
+                    FOREIGN KEY (job_id) REFERENCES cron_jobs(id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_cron_runs_job_id
+                    ON cron_runs(job_id);
+                CREATE INDEX IF NOT EXISTS idx_cron_runs_started_at
+                    ON cron_runs(started_at);
+                """,
+            ),
         ]
 
     async def _init_pool(self) -> None:

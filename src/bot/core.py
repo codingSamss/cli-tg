@@ -30,6 +30,7 @@ from ..claude.task_registry import TaskRegistry
 from ..config.settings import Settings
 from ..exceptions import ClaudeCodeTelegramError
 from ..security.validators import SecurityValidator
+from ..services import CronSchedulerService
 from ..storage.facade import Storage
 from .features.registry import FeatureRegistry
 from .inbound_task_queue import InboundTaskQueue
@@ -132,6 +133,7 @@ class ClaudeCodeBot:
         self.deps["task_registry"] = TaskRegistry()
         self.deps["inbound_task_queue"] = InboundTaskQueue()
         self._initialize_update_tracking()
+        self._seed_app_bot_data()
 
         # Set bot commands for menu
         await self._set_bot_commands()
@@ -147,6 +149,7 @@ class ClaudeCodeBot:
 
         # Schedule periodic image cleanup
         self._schedule_image_cleanup()
+        await self._bootstrap_cron_scheduler()
 
         # Check .gitignore for .claude-images/
         self._check_gitignore()
@@ -194,6 +197,7 @@ class ClaudeCodeBot:
             ("cancel", command.cancel_task),
             ("queue", command.queue_status_command),
             ("dequeue", command.dequeue_command),
+            ("cron", command.cron_command),
             ("sendpic", command.send_picture_command),
             ("resume", command.resume_command),
             ("model", command.model_command),
@@ -413,6 +417,24 @@ class ClaudeCodeBot:
             return await middleware_func(dummy_handler, update, context.bot_data)
 
         return middleware_wrapper
+
+    def _seed_app_bot_data(self) -> None:
+        """Seed global bot_data for non-update workflows (for example cron jobs)."""
+        app = self._require_app()
+        for key, value in self.deps.items():
+            app.bot_data[key] = value
+        app.bot_data["settings"] = self.settings
+
+    async def _bootstrap_cron_scheduler(self) -> None:
+        """Bootstrap cron scheduler service after app/job queue is ready."""
+        app = self._require_app()
+        scheduler = self.deps.get("cron_scheduler_service")
+        if not isinstance(scheduler, CronSchedulerService):
+            return
+        try:
+            await scheduler.bootstrap(app)
+        except Exception as exc:
+            logger.error("Failed to bootstrap cron scheduler", error=str(exc))
 
     def _schedule_image_cleanup(self) -> None:
         """Register periodic image cleanup job."""

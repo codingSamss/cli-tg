@@ -243,6 +243,95 @@ class SessionEventModel:
 
 
 @dataclass
+class CronJobModel:
+    """Cron/reminder job model."""
+
+    user_id: int
+    job_type: str
+    schedule_type: str
+    payload_text: str
+    chat_id: int
+    thread_id: int
+    scope_key: str
+    project_dir: str
+    id: Optional[int] = None
+    cron_expr: Optional[str] = None
+    run_at: Optional[datetime] = None
+    engine: Optional[str] = None
+    session_id: Optional[str] = None
+    status: str = "enabled"
+    fail_count: int = 0
+    last_error: Optional[str] = None
+    last_run_at: Optional[datetime] = None
+    next_run_at: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        data = asdict(self)
+        for key in [
+            "run_at",
+            "last_run_at",
+            "next_run_at",
+            "created_at",
+            "updated_at",
+        ]:
+            value = data.get(key)
+            if isinstance(value, datetime):
+                data[key] = value.isoformat()
+        return data
+
+    @classmethod
+    def from_row(cls, row: aiosqlite.Row) -> "CronJobModel":
+        """Create from database row."""
+        data = dict(row)
+        for field in [
+            "run_at",
+            "last_run_at",
+            "next_run_at",
+            "created_at",
+            "updated_at",
+        ]:
+            if data.get(field):
+                data[field] = datetime.fromisoformat(data[field])
+        return cls(**data)
+
+
+@dataclass
+class CronRunModel:
+    """Cron execution run record model."""
+
+    job_id: int
+    user_id: int
+    started_at: datetime
+    success: bool
+    id: Optional[int] = None
+    finished_at: Optional[datetime] = None
+    output_preview: Optional[str] = None
+    error_message: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        data = asdict(self)
+        for key in ["started_at", "finished_at"]:
+            value = data.get(key)
+            if isinstance(value, datetime):
+                data[key] = value.isoformat()
+        return data
+
+    @classmethod
+    def from_row(cls, row: aiosqlite.Row) -> "CronRunModel":
+        """Create from database row."""
+        data = dict(row)
+        for field in ["started_at", "finished_at"]:
+            if data.get(field):
+                data[field] = datetime.fromisoformat(data[field])
+        data["success"] = bool(data.get("success"))
+        return cls(**data)
+
+
+@dataclass
 class CostTrackingModel:
     """Cost tracking data model."""
 
