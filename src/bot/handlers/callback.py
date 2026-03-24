@@ -32,6 +32,7 @@ from ..utils.cli_engine import (
     normalize_cli_engine,
     set_active_cli_engine,
 )
+from ..utils.codex_models import build_codex_model_candidates
 from ..utils.command_menu import sync_chat_command_menu
 from ..utils.recent_projects import build_recent_projects_message, scan_recent_projects
 from ..utils.resume_history import ResumeHistoryMessage, load_resume_history_preview
@@ -437,18 +438,7 @@ def _build_engine_selector_keyboard(
 def _build_codex_model_keyboard(*, selected_model: str | None) -> InlineKeyboardMarkup:
     """Build inline keyboard for Codex model selection callbacks."""
     selected = str(selected_model or "").strip()
-    candidates: list[str] = []
-    for candidate in (
-        selected,
-        "gpt-5.3-codex",
-        "gpt-5.1-codex-mini",
-        "gpt-5",
-    ):
-        value = str(candidate or "").strip().replace("`", "")
-        if not value or value.lower() in {"default", "current"}:
-            continue
-        if value not in candidates:
-            candidates.append(value)
+    candidates = build_codex_model_candidates(selected_model=selected)
 
     rows: list[list[InlineKeyboardButton]] = []
     for value in candidates:
@@ -1436,21 +1426,21 @@ async def handle_model_callback(
     keyboard = [
         [
             InlineKeyboardButton(
-                f"{'> ' if current == 'sonnet' else ''}Sonnet",
+                f"{'✅ ' if current == 'sonnet' else ''}Sonnet",
                 callback_data="model:sonnet",
             ),
             InlineKeyboardButton(
-                f"{'> ' if current == 'opus' else ''}Opus",
+                f"{'✅ ' if current == 'opus' else ''}Opus",
                 callback_data="model:opus",
             ),
             InlineKeyboardButton(
-                f"{'> ' if current == 'haiku' else ''}Haiku",
+                f"{'✅ ' if current == 'haiku' else ''}Haiku",
                 callback_data="model:haiku",
             ),
         ],
         [
             InlineKeyboardButton(
-                f"{'> ' if not current else ''}Default",
+                f"{'✅ ' if not current else ''}Default",
                 callback_data="model:default",
             ),
         ],

@@ -743,6 +743,46 @@ class CronJobRepository:
             rows = await cursor.fetchall()
             return [CronJobModel.from_row(row) for row in rows]
 
+    async def list_active_reminder_jobs(
+        self,
+        *,
+        user_id: int,
+        scope_key: Optional[str] = None,
+        limit: int = 5,
+    ) -> List[CronJobModel]:
+        """List newest active reminder jobs for one user."""
+        safe_limit = max(1, int(limit))
+        query = """
+            SELECT * FROM cron_jobs
+            WHERE user_id = ?
+              AND job_type = 'reminder'
+              AND status IN ('enabled', 'paused')
+        """
+        params: list[Any] = [user_id]
+        if scope_key is not None and str(scope_key).strip():
+            query += " AND scope_key = ?"
+            params.append(str(scope_key).strip())
+        query += " ORDER BY updated_at DESC, id DESC LIMIT ?"
+        params.append(safe_limit)
+
+        async with self.db.get_connection() as conn:
+            cursor = await conn.execute(query, params)
+            rows = await cursor.fetchall()
+            return [CronJobModel.from_row(row) for row in rows]
+
+    async def get_latest_active_reminder(
+        self, *, user_id: int, scope_key: Optional[str] = None
+    ) -> Optional[CronJobModel]:
+        """Get the latest active reminder for one user."""
+        jobs = await self.list_active_reminder_jobs(
+            user_id=user_id,
+            scope_key=scope_key,
+            limit=1,
+        )
+        if not jobs:
+            return None
+        return jobs[0]
+
     async def count_user_active_jobs(self, *, user_id: int) -> int:
         """Count enabled/paused jobs for one user."""
         async with self.db.get_connection() as conn:
@@ -754,6 +794,26 @@ class CronJobRepository:
                 """,
                 (user_id,),
             )
+            row = await cursor.fetchone()
+            return int(row[0]) if row else 0
+
+    async def count_user_active_reminder_jobs(
+        self, *, user_id: int, scope_key: Optional[str] = None
+    ) -> int:
+        """Count enabled reminder jobs for one user."""
+        query = """
+            SELECT COUNT(*) FROM cron_jobs
+            WHERE user_id = ?
+              AND job_type = 'reminder'
+              AND status = 'enabled'
+        """
+        params: list[Any] = [user_id]
+        if scope_key is not None and str(scope_key).strip():
+            query += " AND scope_key = ?"
+            params.append(str(scope_key).strip())
+
+        async with self.db.get_connection() as conn:
+            cursor = await conn.execute(query, params)
             row = await cursor.fetchone()
             return int(row[0]) if row else 0
 
@@ -791,6 +851,44 @@ class CronJobRepository:
             params.append(user_id)
         async with self.db.get_connection() as conn:
             cursor = await conn.execute(query, params)
+            await conn.commit()
+            return cursor.rowcount > 0
+
+    async def update_job_definition(
+        self,
+        *,
+        job_id: int,
+        user_id: int,
+        schedule_type: str,
+        payload_text: str,
+        run_at: Optional[datetime],
+        cron_expr: Optional[str],
+        next_run_at: Optional[datetime],
+    ) -> bool:
+        """Update one job's schedule/content definition."""
+        async with self.db.get_connection() as conn:
+            cursor = await conn.execute(
+                """
+                UPDATE cron_jobs
+                SET schedule_type = ?,
+                    payload_text = ?,
+                    run_at = ?,
+                    cron_expr = ?,
+                    next_run_at = ?,
+                    updated_at = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (
+                    schedule_type,
+                    payload_text,
+                    run_at,
+                    cron_expr,
+                    next_run_at,
+                    datetime.utcnow(),
+                    job_id,
+                    user_id,
+                ),
+            )
             await conn.commit()
             return cursor.rowcount > 0
 

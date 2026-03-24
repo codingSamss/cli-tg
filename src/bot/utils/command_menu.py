@@ -7,7 +7,7 @@ from typing import Any, List
 
 from telegram import BotCommand, BotCommandScopeChat
 
-from .cli_engine import ENGINE_CLAUDE, command_visible_for_engine, normalize_cli_engine
+from .cli_engine import ENGINE_CODEX, command_visible_for_engine, normalize_cli_engine
 
 
 @dataclass(frozen=True)
@@ -61,7 +61,7 @@ async def sync_chat_command_menu(
     if bot is None or not isinstance(chat_id, int) or chat_id <= 0:
         return []
 
-    normalized = normalize_cli_engine(engine or ENGINE_CLAUDE)
+    normalized = normalize_cli_engine(engine or ENGINE_CODEX)
     commands = build_bot_commands_for_engine(normalized)
     await bot.set_my_commands(
         commands=commands,

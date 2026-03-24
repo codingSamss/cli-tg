@@ -36,7 +36,7 @@ packages = [{include = "src"}]
 
 [tool.poetry.dependencies]
 python = "^3.10"
-python-telegram-bot = "^22.1"
+python-telegram-bot = {version = "^22.1", extras = ["job-queue"]}
 structlog = "^25.4.0"
 pydantic = "^2.11.5"
 pydantic-settings = "^2.9.1"

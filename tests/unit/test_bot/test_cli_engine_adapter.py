@@ -358,6 +358,9 @@ async def test_model_command_shows_switch_hint_for_codex_engine(tmp_path):
         "reply_markup"
     ].inline_keyboard
     callback_ids = [btn.callback_data for row in keyboard for btn in row]
+    assert "model:codex:gpt-5.4" in callback_ids
+    assert "model:codex:gpt-5.4-mini" in callback_ids
+    assert "model:codex:gpt-5.4-nano" in callback_ids
     assert "model:codex:gpt-5.3-codex" in callback_ids
     assert "model:codex:default" in callback_ids
 
@@ -426,6 +429,39 @@ async def test_model_command_codex_can_set_and_reset_model(tmp_path):
     context.args = ["default"]
     await model_command(update, context)
     assert "claude_model" not in scope_state
+
+
+@pytest.mark.asyncio
+async def test_model_command_codex_menu_keeps_non_preset_selected_model(tmp_path):
+    """Codex /model menu should keep showing a selected non-preset model."""
+    approved = tmp_path / "approved"
+    approved.mkdir()
+    user_id = 10044
+    scope_key = _scope_key(user_id, user_id)
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=user_id),
+        effective_chat=SimpleNamespace(id=user_id),
+        effective_message=SimpleNamespace(message_thread_id=None),
+        message=SimpleNamespace(reply_text=AsyncMock()),
+    )
+    context = SimpleNamespace(
+        args=["gpt-5.1-codex-mini"],
+        bot_data={"settings": _build_settings(approved)},
+        user_data={"scope_state": {scope_key: {ENGINE_STATE_KEY: "codex"}}},
+    )
+
+    await model_command(update, context)
+
+    keyboard = update.message.reply_text.await_args.kwargs[
+        "reply_markup"
+    ].inline_keyboard
+    callback_ids = [btn.callback_data for row in keyboard for btn in row]
+    assert "model:codex:gpt-5.1-codex-mini" in callback_ids
+    assert "model:codex:gpt-5.4" in callback_ids
+    assert "model:codex:gpt-5.4-mini" in callback_ids
+    assert "model:codex:gpt-5.4-nano" in callback_ids
+    assert "model:codex:gpt-5.3-codex" in callback_ids
+    assert "model:codex:default" in callback_ids
 
 
 @pytest.mark.asyncio
@@ -567,6 +603,10 @@ async def test_model_callback_sets_model_for_codex_engine(tmp_path):
     assert "当前设置：`gpt-5.3-codex`" in rendered
     keyboard = query.edit_message_text.await_args.kwargs["reply_markup"].inline_keyboard
     callback_ids = [btn.callback_data for row in keyboard for btn in row]
+    assert "model:codex:gpt-5.4" in callback_ids
+    assert "model:codex:gpt-5.4-mini" in callback_ids
+    assert "model:codex:gpt-5.4-nano" in callback_ids
+    assert "model:codex:gpt-5.3-codex" in callback_ids
     assert "model:codex:default" in callback_ids
 
 
@@ -610,6 +650,9 @@ async def test_model_callback_for_claude_clears_session_and_forces_new(tmp_path)
     rendered = query.edit_message_text.await_args.args[0]
     assert "模型设置已更新" in rendered
     assert "下一条消息将从新会话开始" in rendered
+    keyboard = query.edit_message_text.await_args.kwargs["reply_markup"].inline_keyboard
+    button_texts = [btn.text for row in keyboard for btn in row]
+    assert "✅ Opus" in button_texts
 
 
 @pytest.mark.asyncio
@@ -888,6 +931,23 @@ def test_get_cli_integration_respects_active_engine_with_fallback():
     )
     assert fallback_engine == "codex"
     assert fallback_selected is claude_integration
+
+
+def test_get_cli_integration_defaults_to_codex_when_scope_engine_missing():
+    """Adapter resolver should default to codex when scope has no engine state."""
+    claude_integration = object()
+    codex_integration = object()
+    engine, selected = get_cli_integration(
+        bot_data={
+            "cli_integrations": {
+                "claude": claude_integration,
+                "codex": codex_integration,
+            }
+        },
+        scope_state={},
+    )
+    assert engine == ENGINE_CODEX
+    assert selected is codex_integration
 
 
 @pytest.mark.asyncio

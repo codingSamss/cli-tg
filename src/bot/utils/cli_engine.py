@@ -46,11 +46,11 @@ COMMAND_ENGINE_VISIBILITY: dict[str, tuple[str, ...]] = {
 
 
 def normalize_cli_engine(value: str | None) -> str:
-    """Normalize requested engine and fallback to Claude."""
+    """Normalize requested engine and fallback to Codex."""
     normalized = str(value or "").strip().lower()
     if normalized in SUPPORTED_CLI_ENGINES:
         return normalized
-    return ENGINE_CLAUDE
+    return ENGINE_CODEX
 
 
 def get_active_cli_engine(scope_state: Mapping[str, Any]) -> str:

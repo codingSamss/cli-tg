@@ -35,7 +35,9 @@ async def test_update_guard_marks_update_activity_timestamp():
     bot._update_offset_store = SimpleNamespace(record=lambda _update_id: None)
     assert bot._last_update_activity_monotonic == 0.0
 
-    await bot._handle_update_guard(SimpleNamespace(update_id=2026002), SimpleNamespace())
+    await bot._handle_update_guard(
+        SimpleNamespace(update_id=2026002), SimpleNamespace()
+    )
 
     assert bot._last_update_activity_monotonic > 0.0
 

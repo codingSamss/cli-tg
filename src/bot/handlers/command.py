@@ -36,6 +36,7 @@ from ..utils.cli_engine import (
     normalize_cli_engine,
     set_active_cli_engine,
 )
+from ..utils.codex_models import build_codex_model_candidates
 from ..utils.command_menu import sync_chat_command_menu
 from ..utils.recent_projects import build_recent_projects_message, scan_recent_projects
 from ..utils.resume_ui import build_resume_project_selector
@@ -92,7 +93,8 @@ async def _reply_update_message_resilient(
         return None
 
     send_kwargs: dict[str, Any] = {}
-    chat_type = getattr(update.effective_chat, "type", None)
+    effective_chat = getattr(update, "effective_chat", None)
+    chat_type = getattr(effective_chat, "type", None)
     should_quote_reply = str(chat_type or "").strip().lower() != "private"
     if prepared_parse_mode is not None:
         send_kwargs["parse_mode"] = prepared_parse_mode
@@ -509,19 +511,10 @@ def _build_codex_model_keyboard(
 ) -> InlineKeyboardMarkup:
     """Build inline keyboard for Codex model selection."""
     selected = str(selected_model or "").strip()
-    candidates: list[str] = []
-    for candidate in (
-        resolved_model,
-        selected,
-        "gpt-5.3-codex",
-        "gpt-5.1-codex-mini",
-        "gpt-5",
-    ):
-        value = str(candidate or "").strip().replace("`", "")
-        if not value or value.lower() in {"default", "current"}:
-            continue
-        if value not in candidates:
-            candidates.append(value)
+    candidates = build_codex_model_candidates(
+        selected_model=selected,
+        resolved_model=resolved_model,
+    )
 
     rows: list[list[InlineKeyboardButton]] = []
     for value in candidates:
@@ -2754,21 +2747,21 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     keyboard = [
         [
             InlineKeyboardButton(
-                f"{'> ' if current == 'sonnet' else ''}Sonnet",
+                f"{'✅ ' if current == 'sonnet' else ''}Sonnet",
                 callback_data="model:sonnet",
             ),
             InlineKeyboardButton(
-                f"{'> ' if current == 'opus' else ''}Opus",
+                f"{'✅ ' if current == 'opus' else ''}Opus",
                 callback_data="model:opus",
             ),
             InlineKeyboardButton(
-                f"{'> ' if current == 'haiku' else ''}Haiku",
+                f"{'✅ ' if current == 'haiku' else ''}Haiku",
                 callback_data="model:haiku",
             ),
         ],
         [
             InlineKeyboardButton(
-                f"{'> ' if not current else ''}Default",
+                f"{'✅ ' if not current else ''}Default",
                 callback_data="model:default",
             ),
         ],

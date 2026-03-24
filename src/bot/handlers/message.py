@@ -145,6 +145,21 @@ _STATUS_REACTION_WEB_TOOL_TOKENS = (
     "web-fetch",
     "browser",
 )
+_EN_RELATIVE_REMINDER_PATTERN = re.compile(
+    r"\b(in|after)\s+\d+\s*(second|minute|hour|day|week|month)s?\b",
+    re.IGNORECASE,
+)
+_ZH_RELATIVE_REMINDER_PATTERN = re.compile(r"\d+\s*(秒|分钟|小时|天|周|个月)后")
+_ZH_REMINDER_ADJUST_PATTERN = re.compile(
+    r"(改成|改到|改为|改下|换成|提前|推迟|延后|晚点|早点|太晚|太早)"
+)
+_ZH_REMINDER_TIME_HINT_PATTERN = re.compile(
+    r"(今天|明天|后天|早上|上午|中午|下午|晚上|凌晨|周[一二三四五六日天]|星期[一二三四五六日天])"
+)
+_EN_REMINDER_ADJUST_PATTERN = re.compile(
+    r"\b(reschedule|move|change|instead|earlier|later|too late|too early)\b",
+    re.IGNORECASE,
+)
 
 
 def _elapsed_monotonic_ms(started_at: float, current_at: Optional[float] = None) -> int:
@@ -653,6 +668,52 @@ async def _send_chat_action_heartbeat(
             await asyncio.wait_for(stop_event.wait(), timeout=wait_timeout)
         except asyncio.TimeoutError:
             continue
+
+
+def _looks_like_reminder_request(text: str) -> bool:
+    """Best-effort classifier for reminder-like prompts."""
+    raw_text = str(text or "").strip()
+    if not raw_text:
+        return False
+    normalized = raw_text.lower()
+    keyword_tokens = (
+        "提醒",
+        "提醒我",
+        "闹钟",
+        "定时",
+        "叫我",
+        "通知我",
+        "remind",
+        "alarm",
+        "cron",
+        "every day",
+        "every week",
+        "every month",
+        "每天",
+        "每周",
+        "每月",
+        "工作日",
+    )
+    if any(token in normalized for token in keyword_tokens):
+        return True
+    if _EN_RELATIVE_REMINDER_PATTERN.search(normalized):
+        return True
+    return _ZH_RELATIVE_REMINDER_PATTERN.search(raw_text) is not None
+
+
+def _looks_like_reminder_adjustment(text: str) -> bool:
+    """Best-effort classifier for follow-up reminder update prompts."""
+    raw_text = str(text or "").strip()
+    if not raw_text:
+        return False
+    normalized = raw_text.lower()
+    if _ZH_REMINDER_ADJUST_PATTERN.search(raw_text):
+        return True
+    if _EN_REMINDER_ADJUST_PATTERN.search(normalized):
+        return True
+    if _ZH_REMINDER_TIME_HINT_PATTERN.search(raw_text):
+        return True
+    return False
 
 
 def _is_claude_model_name(value: str | None) -> bool:
@@ -2007,11 +2068,24 @@ def _get_stream_merge_key(update_obj: Any) -> Optional[str]:
 
 def _should_collect_thinking_update(update_obj: Any) -> bool:
     """Whether this stream update should appear in expandable thinking details."""
-    if getattr(update_obj, "type", None) != "assistant":
+    update_type = str(getattr(update_obj, "type", "") or "").strip().lower()
+    content = str(getattr(update_obj, "content", "") or "").strip()
+    metadata = getattr(update_obj, "metadata", None) or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    item_type = str(metadata.get("item_type") or "").strip().lower()
+    if update_type == "progress":
+        if item_type == "command_execution":
+            return False
+        return bool(content)
+
+    if update_type != "assistant":
         return False
     if getattr(update_obj, "tool_calls", None):
         return False
-    content = str(getattr(update_obj, "content", "") or "").strip()
+    if item_type == "agent_message":
+        return False
     return bool(content)
 
 
@@ -2399,9 +2473,22 @@ def _cache_thinking_data(
     if user_data is None:
         return
 
+    sanitized_lines: list[str] = []
+    fallback_lines: list[str] = []
+    for raw_line in lines:
+        normalized = str(raw_line or "").strip()
+        if not normalized:
+            continue
+        fallback_lines.append(normalized)
+        if _is_command_execution_progress_block(normalized):
+            continue
+        sanitized_lines.append(normalized)
+    if not sanitized_lines:
+        sanitized_lines = fallback_lines
+
     cache_key = f"thinking:{message_id}"
     user_data[cache_key] = {
-        "lines": list(lines),
+        "lines": sanitized_lines,
         "summary": summary,
     }
 
@@ -2686,52 +2773,276 @@ async def handle_text_message(
         )
 
     cron_scheduler = context.bot_data.get("cron_scheduler_service")
+    should_try_nl_reminder = False
     if isinstance(cron_scheduler, CronSchedulerService):
-        current_dir_raw = scope_state.get(
-            "current_directory", settings.approved_directory
-        )
-        current_dir = (
-            Path(current_dir_raw)
-            if isinstance(current_dir_raw, (str, Path))
-            else settings.approved_directory
-        )
-        try:
-            reminder_job = await cron_scheduler.create_natural_language_reminder(
-                text=message_text,
-                user_id=user_id,
-                chat_id=input_chat_id,
-                thread_id=int(getattr(telegram_message, "message_thread_id", 0) or 0),
-                scope_key=scope_key,
-                project_dir=current_dir,
-            )
-        except CronValidationError as exc:
-            await _reply_text_resilient(telegram_message, f"⚠️ {exc}")
-            return
-        if reminder_job is not None:
-            run_at = getattr(reminder_job, "run_at", None)
-            if isinstance(run_at, datetime):
-                run_at_local = (
-                    run_at.replace(tzinfo=timezone.utc)
-                    .astimezone(timezone(timedelta(hours=8), name="UTC+8"))
-                    .strftime("%Y-%m-%d %H:%M:%S")
-                )
-            else:
-                run_at_local = "unknown"
-            await _reply_text_resilient(
-                telegram_message,
-                (
-                    f"⏰ 已创建提醒 #{reminder_job.id}。\n"
-                    f"将在北京时间 {run_at_local} 提醒你：{reminder_job.payload_text}"
-                ),
-            )
-            if audit_logger:
-                await audit_logger.log_command(
+        if _looks_like_reminder_request(message_text):
+            should_try_nl_reminder = True
+        elif _looks_like_reminder_adjustment(message_text):
+            try:
+                should_try_nl_reminder = await cron_scheduler.has_active_reminder(
                     user_id=user_id,
-                    command="cron_nl",
-                    args=[str(reminder_job.id)],
-                    success=True,
+                    scope_key=scope_key,
                 )
-            return
+            except Exception as exc:
+                logger.debug(
+                    "Failed to probe active reminder before NL update",
+                    user_id=user_id,
+                    error=str(exc),
+                )
+
+    initial_thinking_line = "🤔 正在处理你的请求..."
+    cancel_keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Cancel", callback_data="cancel:task")]]
+    )
+    progress_msg: Any = None
+    reaction_controller: Optional[_MessageStatusReactionController] = None
+    request_timing = _RequestTimingDiagnostics(
+        request_started_monotonic=time.monotonic()
+    )
+
+    if isinstance(cron_scheduler, CronSchedulerService) and should_try_nl_reminder:
+        nl_active_engine, nl_cli_integration = get_cli_integration(
+            bot_data=context.bot_data,
+            scope_state=scope_state,
+        )
+        if nl_cli_integration is not None:
+            if getattr(settings, "status_reactions_enabled", True):
+                await _set_message_reaction_safe(
+                    getattr(context, "bot", None),
+                    chat_id=input_chat_id,
+                    message_id=input_message_id,
+                    emoji=_BOT_REACTION_EMOJIS["queued"],
+                )
+
+            reminder_typing_stop_event = asyncio.Event()
+            reminder_typing_heartbeat_task: Optional[asyncio.Task] = (
+                asyncio.create_task(
+                    _send_chat_action_heartbeat(
+                        message=telegram_message,
+                        action="typing",
+                        stop_event=reminder_typing_stop_event,
+                        message_thread_id=getattr(
+                            telegram_message, "message_thread_id", None
+                        ),
+                        chat_type=getattr(effective_chat, "type", None),
+                    )
+                )
+            )
+            current_dir_raw = scope_state.get(
+                "current_directory", settings.approved_directory
+            )
+            current_dir = (
+                Path(current_dir_raw)
+                if isinstance(current_dir_raw, (str, Path))
+                else settings.approved_directory
+            )
+            if progress_msg is None:
+                progress_init_started_at = time.monotonic()
+                progress_msg = await _reply_text_resilient(
+                    telegram_message,
+                    _with_engine_badge(initial_thinking_line, nl_active_engine),
+                    parse_mode="Markdown",
+                    reply_to_message_id=input_message_id,
+                    reply_markup=cancel_keyboard,
+                )
+                request_timing.progress_init_send_ms = _elapsed_monotonic_ms(
+                    progress_init_started_at
+                )
+                reaction_controller = _MessageStatusReactionController(
+                    enabled=getattr(settings, "status_reactions_enabled", True),
+                    bot=context.bot,
+                    chat_id=input_chat_id,
+                    message_id=input_message_id,
+                    debounce_ms=getattr(settings, "status_reaction_debounce_ms", 700),
+                    stall_soft_ms=getattr(
+                        settings, "status_reaction_stall_soft_ms", 10000
+                    ),
+                    stall_hard_ms=getattr(
+                        settings, "status_reaction_stall_hard_ms", 30000
+                    ),
+                )
+                await reaction_controller.set_queued()
+
+            probe_progress_lines: list[str] = [initial_thinking_line]
+            probe_progress_merge_keys: list[Optional[str]] = [None]
+            probe_last_progress_text = _with_engine_badge(
+                initial_thinking_line, nl_active_engine
+            )
+
+            async def _reminder_probe_stream_handler(update_obj: Any) -> None:
+                nonlocal probe_last_progress_text
+                try:
+                    progress_text = await _format_progress_update(update_obj)
+                    if not progress_text:
+                        return
+                    merge_key = _get_stream_merge_key(update_obj)
+                    _append_progress_line_with_merge(
+                        progress_lines=probe_progress_lines,
+                        progress_merge_keys=probe_progress_merge_keys,
+                        progress_text=progress_text,
+                        merge_key=merge_key,
+                    )
+                    full_text = _with_engine_badge(
+                        _join_progress_lines_for_display(probe_progress_lines),
+                        nl_active_engine,
+                    )
+                    if full_text == probe_last_progress_text:
+                        return
+                    probe_last_progress_text = full_text
+                    if progress_msg is not None:
+                        await progress_msg.edit_text(
+                            full_text,
+                            parse_mode="Markdown",
+                            reply_markup=cancel_keyboard,
+                        )
+                except Exception as exc:
+                    logger.debug(
+                        "Failed to process reminder probe update",
+                        error=str(exc),
+                    )
+
+            try:
+                reminder_result = await cron_scheduler.create_natural_language_reminder(
+                    text=message_text,
+                    user_id=user_id,
+                    chat_id=input_chat_id,
+                    thread_id=int(
+                        getattr(telegram_message, "message_thread_id", 0) or 0
+                    ),
+                    scope_key=scope_key,
+                    project_dir=current_dir,
+                    cli_integration=nl_cli_integration,
+                    on_stream=_reminder_probe_stream_handler,
+                )
+            except CronValidationError as exc:
+                if reaction_controller is not None:
+                    await reaction_controller.set_error()
+                elif getattr(settings, "status_reactions_enabled", True):
+                    await _set_message_reaction_safe(
+                        getattr(context, "bot", None),
+                        chat_id=input_chat_id,
+                        message_id=input_message_id,
+                        emoji=_BOT_REACTION_EMOJIS["error"],
+                    )
+                error_text = f"⚠️ {exc}"
+                if progress_msg is not None:
+                    try:
+                        await progress_msg.edit_text(error_text)
+                    except Exception:
+                        await _reply_text_resilient(telegram_message, error_text)
+                else:
+                    await _reply_text_resilient(telegram_message, error_text)
+                reminder_typing_stop_event.set()
+                if (
+                    reminder_typing_heartbeat_task
+                    and not reminder_typing_heartbeat_task.done()
+                ):
+                    reminder_typing_heartbeat_task.cancel()
+                    try:
+                        await reminder_typing_heartbeat_task
+                    except asyncio.CancelledError:
+                        pass
+                return
+            finally:
+                reminder_typing_stop_event.set()
+                if (
+                    reminder_typing_heartbeat_task
+                    and not reminder_typing_heartbeat_task.done()
+                ):
+                    reminder_typing_heartbeat_task.cancel()
+                    try:
+                        await reminder_typing_heartbeat_task
+                    except asyncio.CancelledError:
+                        pass
+
+            if reminder_result is not None:
+                reminder_job = reminder_result.job
+                reminder_action = str(getattr(reminder_result, "action", "") or "")
+                pending_count = 0
+                try:
+                    pending_count = await cron_scheduler.count_user_pending_reminders(
+                        user_id=user_id
+                    )
+                except Exception:
+                    pending_count = 0
+
+                if str(getattr(reminder_job, "schedule_type", "")) == "cron":
+                    next_run = getattr(reminder_job, "next_run_at", None)
+                    if isinstance(next_run, datetime):
+                        next_local = (
+                            next_run.replace(tzinfo=timezone.utc)
+                            .astimezone(timezone(timedelta(hours=8), name="UTC+8"))
+                            .strftime("%Y-%m-%d %H:%M:%S")
+                        )
+                    else:
+                        next_local = "unknown"
+                    title = (
+                        "✅ 已更新周期提醒"
+                        if reminder_action == "updated"
+                        else "✅ 已设置周期提醒"
+                    )
+                    confirmation_text = (
+                        f"{title}\n\n"
+                        f"• 时间规则：{reminder_job.cron_expr}\n"
+                        f"• 下次提醒（北京时间）：{next_local}\n"
+                        f"• 内容：{reminder_job.payload_text}\n"
+                        f"• 当前待提醒：{pending_count} 条"
+                    )
+                else:
+                    run_at = getattr(reminder_job, "run_at", None)
+                    if isinstance(run_at, datetime):
+                        run_at_local = (
+                            run_at.replace(tzinfo=timezone.utc)
+                            .astimezone(timezone(timedelta(hours=8), name="UTC+8"))
+                            .strftime("%Y-%m-%d %H:%M:%S")
+                        )
+                    else:
+                        run_at_local = "unknown"
+                    title = (
+                        "✅ 已更新提醒"
+                        if reminder_action == "updated"
+                        else "✅ 已设置提醒"
+                    )
+                    confirmation_text = (
+                        f"{title}\n\n"
+                        f"• 时间：北京时间 {run_at_local}\n"
+                        f"• 内容：{reminder_job.payload_text}\n"
+                        f"• 当前待提醒：{pending_count} 条"
+                    )
+                if progress_msg is not None:
+                    try:
+                        await progress_msg.edit_text(confirmation_text)
+                    except Exception:
+                        await _reply_text_resilient(telegram_message, confirmation_text)
+                else:
+                    await _reply_text_resilient(telegram_message, confirmation_text)
+                if reaction_controller is not None:
+                    await reaction_controller.set_done()
+                elif getattr(settings, "status_reactions_enabled", True):
+                    await _set_message_reaction_safe(
+                        getattr(context, "bot", None),
+                        chat_id=input_chat_id,
+                        message_id=input_message_id,
+                        emoji=_BOT_REACTION_EMOJIS["done"],
+                    )
+                if audit_logger:
+                    await audit_logger.log_command(
+                        user_id=user_id,
+                        command="cron_nl",
+                        args=[str(reminder_job.id or "")],
+                        success=True,
+                    )
+                return
+
+            if progress_msg is not None:
+                try:
+                    await progress_msg.edit_text(
+                        _with_engine_badge(initial_thinking_line, nl_active_engine),
+                        parse_mode="Markdown",
+                        reply_markup=cancel_keyboard,
+                    )
+                except Exception:
+                    pass
 
     logger.info(
         "Processing text message", user_id=user_id, message_length=len(message_text)
@@ -2739,11 +3050,9 @@ async def handle_text_message(
 
     typing_stop_event = asyncio.Event()
     typing_heartbeat_task: Optional[asyncio.Task] = None
-    reaction_controller: Optional[_MessageStatusReactionController] = None
-    progress_msg: Any = None
     all_progress_lines: list[str] = []
     frozen_messages: list[Any] = []
-    request_timing = _RequestTimingDiagnostics(
+    request_timing = request_timing or _RequestTimingDiagnostics(
         request_started_monotonic=time.monotonic()
     )
     request_outcome = "running"
@@ -2782,6 +3091,13 @@ async def handle_text_message(
                     ),
                     reply_markup=_build_queue_remove_keyboard(queue_id),
                 )
+            if progress_msg is not None:
+                try:
+                    await progress_msg.delete()
+                except Exception:
+                    logger.debug("Failed to delete pending progress message")
+            if reaction_controller is not None:
+                await reaction_controller.clear()
             return
 
         # Keep typing indicator alive while the thinking/progress flow is running.
@@ -2817,33 +3133,28 @@ async def handle_text_message(
             )
             return
 
-        initial_thinking_line = "🤔 正在处理你的请求..."
-
-        # Create progress message with Cancel button
-        cancel_keyboard = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Cancel", callback_data="cancel:task")]]
-        )
-        progress_init_started_at = time.monotonic()
-        progress_msg = await _reply_text_resilient(
-            telegram_message,
-            _with_engine_badge(initial_thinking_line, active_engine),
-            parse_mode="Markdown",
-            reply_to_message_id=input_message_id,
-            reply_markup=cancel_keyboard,
-        )
-        request_timing.progress_init_send_ms = _elapsed_monotonic_ms(
-            progress_init_started_at
-        )
-        reaction_controller = _MessageStatusReactionController(
-            enabled=getattr(settings, "status_reactions_enabled", True),
-            bot=context.bot,
-            chat_id=input_chat_id,
-            message_id=input_message_id,
-            debounce_ms=getattr(settings, "status_reaction_debounce_ms", 700),
-            stall_soft_ms=getattr(settings, "status_reaction_stall_soft_ms", 10000),
-            stall_hard_ms=getattr(settings, "status_reaction_stall_hard_ms", 30000),
-        )
-        await reaction_controller.set_queued()
+        if progress_msg is None:
+            progress_init_started_at = time.monotonic()
+            progress_msg = await _reply_text_resilient(
+                telegram_message,
+                _with_engine_badge(initial_thinking_line, active_engine),
+                parse_mode="Markdown",
+                reply_to_message_id=input_message_id,
+                reply_markup=cancel_keyboard,
+            )
+            request_timing.progress_init_send_ms = _elapsed_monotonic_ms(
+                progress_init_started_at
+            )
+            reaction_controller = _MessageStatusReactionController(
+                enabled=getattr(settings, "status_reactions_enabled", True),
+                bot=context.bot,
+                chat_id=input_chat_id,
+                message_id=input_message_id,
+                debounce_ms=getattr(settings, "status_reaction_debounce_ms", 700),
+                stall_soft_ms=getattr(settings, "status_reaction_stall_soft_ms", 10000),
+                stall_hard_ms=getattr(settings, "status_reaction_stall_hard_ms", 30000),
+            )
+            await reaction_controller.set_queued()
 
         # Get current directory
         current_dir = scope_state.get("current_directory", settings.approved_directory)

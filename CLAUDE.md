@@ -194,6 +194,8 @@ Pydantic Settings v2 从环境变量加载（`src/config/settings.py`）。必�
 - Commit 标题保持 Conventional Commits 风格；**commit 备注正文必须使用中文**，明确记录动机、改动范围、验证结论。
 - 合并到主干时必须保留分支轨迹：使用 `git merge --no-ff <branch>`（或等效 Merge PR），不要 fast-forward 抹平历史。
 - 当前主干分支是 `master`（若后续迁移到 `main`，同样遵循以上规则）。
+- 提交并推送到 GitHub 时必须同步打 `tag`（建议语义化版本，例如 `vX.Y.Z`），并确保 tag 被推送（例如 `git push origin <branch> --follow-tags`）。
+- `tag` 必须使用注解标签（annotated tag），注解内容要求用中文分点概括改动（示例：`- 新增：...`、`- 修复：...`、`- 重构/测试/文档：...`）。
 
 ## 提交前隐私安全检查（强制）
 

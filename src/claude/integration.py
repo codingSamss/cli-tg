@@ -803,6 +803,7 @@ class ClaudeProcessManager:
                     continue
 
                 message_buffer.append(msg)
+                msg_type = str(msg.get("type") or "").strip()
 
                 # Process immediately to avoid memory buildup
                 update = self._parse_stream_message(msg)
@@ -811,26 +812,29 @@ class ClaudeProcessManager:
                     update=update,
                 )
                 if update and stream_callback:
-                    try:
-                        await stream_callback(update)
-                    except Exception as e:
-                        logger.warning(
-                            "Stream callback failed",
-                            error=str(e),
-                            update_type=update.type,
-                        )
+                    # Codex turn_context may carry a requested model that is
+                    # not the runtime-resolved model. Keep the live stream
+                    # focused on the final snapshot-derived model instead.
+                    if not (cli_kind == "codex" and msg_type == "turn_context"):
+                        try:
+                            await stream_callback(update)
+                        except Exception as e:
+                            logger.warning(
+                                "Stream callback failed",
+                                error=str(e),
+                                update_type=update.type,
+                            )
                 if (
                     cli_kind == "codex"
                     and update
                     and update.type == "system"
                     and (update.metadata or {}).get("subtype") == "model_resolved"
+                    and msg_type != "turn_context"
                 ):
                     codex_emitted_model = str(
                         (update.metadata or {}).get("model") or ""
                     ).strip()
-
                 if cli_kind == "codex":
-                    msg_type = str(msg.get("type") or "").strip()
                     if msg_type == "thread.started":
                         codex_thread_id = str(msg.get("thread_id") or "").strip()
                     codex_emitted_model = (

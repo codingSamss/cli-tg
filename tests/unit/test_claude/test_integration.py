@@ -697,6 +697,56 @@ def test_parse_stream_message_supports_codex_turn_context_model(tmp_path):
     assert update.metadata and update.metadata.get("model") == "gpt-5.2-codex"
 
 
+@pytest.mark.asyncio
+async def test_handle_process_output_prefers_snapshot_codex_model_over_turn_context(
+    tmp_path, monkeypatch
+):
+    """Codex should only surface the runtime-resolved model once from snapshot."""
+    manager = _build_manager(tmp_path)
+    lines = [
+        '{"type":"thread.started","thread_id":"019c-thread"}',
+        '{"type":"turn_context","payload":{"model":"gpt-5.3-codex"}}',
+        '{"type":"turn.started"}',
+        '{"type":"turn.completed","duration_ms":2,"usage":{"input_tokens":3}}',
+    ]
+
+    async def _fake_stream(_):
+        for line in lines:
+            yield line
+
+    process = SimpleNamespace(
+        stdout=object(),
+        stderr=SimpleNamespace(read=AsyncMock(return_value=b"")),
+        wait=AsyncMock(return_value=0),
+    )
+    monkeypatch.setattr(manager, "_read_stream_bounded", _fake_stream)
+    monkeypatch.setattr(
+        manager,
+        "_probe_codex_model_from_local_session",
+        staticmethod(lambda _sid: "gpt-5.4-mini"),
+    )
+
+    updates = []
+
+    async def _stream_callback(update):
+        updates.append(update)
+
+    response = await manager._handle_process_output(
+        process,
+        stream_callback=_stream_callback,
+        cli_kind="codex",
+    )
+
+    model_updates = [
+        u
+        for u in updates
+        if u.type == "system" and (u.metadata or {}).get("subtype") == "model_resolved"
+    ]
+    assert len(model_updates) == 1
+    assert model_updates[0].metadata.get("model") == "gpt-5.4-mini"
+    assert response.session_id == "019c-thread"
+
+
 def test_process_output_diagnostics_compute_silence_and_result_gaps():
     """Process diagnostics should separate stdout activity from end-to-end wall time."""
     diagnostics = ProcessOutputDiagnostics(process_started_monotonic=10.0)

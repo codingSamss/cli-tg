@@ -13,8 +13,8 @@ from src.bot.handlers.message import (
     _append_progress_line_with_merge,
     _build_collapsed_thinking_summary,
     _build_context_tag,
-    _RequestTimingDiagnostics,
     _build_session_context_summary,
+    _cache_thinking_data,
     _extract_model_from_model_usage,
     _format_error_message,
     _format_progress_update,
@@ -22,13 +22,14 @@ from src.bot.handlers.message import (
     _is_high_priority_stream_update,
     _is_markdown_parse_error,
     _is_noop_edit_error,
-    _should_collect_thinking_update,
     _is_turn_started_update,
     _join_progress_lines_for_display,
     _reply_text_resilient,
-    _resolve_collapsed_fallback_model,
+    _RequestTimingDiagnostics,
     _resolve_codex_context_snapshot,
+    _resolve_collapsed_fallback_model,
     _send_private_final_response_draft,
+    _should_collect_thinking_update,
     _split_text_for_telegram,
     _with_engine_badge,
     handle_photo,
@@ -326,7 +327,9 @@ async def test_handle_text_message_keeps_assistant_intro_line_for_system_updates
 
     await handle_text_message(update, context)
 
-    edited_texts = [str(call.args[0]) for call in progress_msg.edit_text.await_args_list]
+    edited_texts = [
+        str(call.args[0]) for call in progress_msg.edit_text.await_args_list
+    ]
     assert any(
         "🤔 正在处理你的请求..." in text and "🚀 *Starting Codex*" in text
         for text in edited_texts
@@ -564,8 +567,8 @@ def test_get_stream_merge_key_for_mergeable_events():
     assert _get_stream_merge_key(tool_update) is None
 
 
-def test_should_collect_thinking_update_keeps_only_assistant_content():
-    """Thinking details should keep assistant narration only."""
+def test_should_collect_thinking_update_keeps_textual_progress_and_skips_commands():
+    """Thinking details should keep textual progress and skip command/agent final turns."""
     assistant_text = _FakeUpdate(
         type="assistant",
         content="draft answer",
@@ -577,7 +580,23 @@ def test_should_collect_thinking_update_keeps_only_assistant_content():
         content="tool call",
         tool_calls=[{"name": "Read"}],
     )
+    codex_agent_message = _FakeUpdate(
+        type="assistant",
+        content="final answer",
+        metadata={"item_type": "agent_message"},
+        tool_calls=None,
+    )
     progress_update = _FakeUpdate(type="progress", content="working")
+    reasoning_update = _FakeUpdate(
+        type="progress",
+        content="先梳理上下文，再给出答案",
+        metadata={"item_type": "reasoning"},
+    )
+    reasoning_empty = _FakeUpdate(
+        type="progress",
+        content="   ",
+        metadata={"item_type": "reasoning"},
+    )
     command_progress = _FakeUpdate(
         type="progress",
         metadata={"item_type": "command_execution", "status": "in_progress"},
@@ -591,9 +610,30 @@ def test_should_collect_thinking_update_keeps_only_assistant_content():
     assert _should_collect_thinking_update(assistant_text) is True
     assert _should_collect_thinking_update(assistant_empty) is False
     assert _should_collect_thinking_update(assistant_tool) is False
-    assert _should_collect_thinking_update(progress_update) is False
+    assert _should_collect_thinking_update(codex_agent_message) is False
+    assert _should_collect_thinking_update(progress_update) is True
+    assert _should_collect_thinking_update(reasoning_update) is True
+    assert _should_collect_thinking_update(reasoning_empty) is False
     assert _should_collect_thinking_update(command_progress) is False
     assert _should_collect_thinking_update(system_update) is False
+
+
+def test_cache_thinking_data_filters_command_execution_blocks():
+    context = SimpleNamespace(user_data={})
+    _cache_thinking_data(
+        context,
+        message_id=1001,
+        lines=[
+            "🔧 *Running command*\n\n`/bin/zsh -lc 'pwd'`",
+            "🤔 已定位到根因",
+            "✅ *Command completed* \\(exit 0\\)\n\n`/bin/zsh -lc 'pwd'`",
+        ],
+        summary="Thinking done",
+    )
+
+    payload = context.user_data["thinking:1001"]
+    assert payload["summary"] == "Thinking done"
+    assert payload["lines"] == ["🤔 已定位到根因"]
 
 
 def test_get_stream_merge_key_for_command_execution_uses_command_identity():
@@ -1072,12 +1112,14 @@ async def test_resolve_codex_context_snapshot_prefers_live_probe(monkeypatch):
         classmethod(lambda cls, sid: None),
     )
 
-    snapshot, session_summary, rate_limit_summary = await _resolve_codex_context_snapshot(
-        active_engine=ENGINE_CODEX,
-        session_id=session_id,
-        cli_integration=cli_integration,
-        working_directory=Path("/tmp/project"),
-        current_model="gpt-5.4",
+    snapshot, session_summary, rate_limit_summary = (
+        await _resolve_codex_context_snapshot(
+            active_engine=ENGINE_CODEX,
+            session_id=session_id,
+            cli_integration=cli_integration,
+            working_directory=Path("/tmp/project"),
+            current_model="gpt-5.4",
+        )
     )
 
     assert snapshot is not None
@@ -1099,21 +1141,25 @@ async def test_resolve_codex_context_snapshot_falls_back_to_local_probe(monkeypa
         SessionService,
         "resolve_codex_snapshot",
         classmethod(
-            lambda cls, sid: {
-                "used_percent": 25.0,
-                "total_tokens": 200_000,
-                "remaining_tokens": 150_000,
-            }
-            if sid == session_id
-            else None
+            lambda cls, sid: (
+                {
+                    "used_percent": 25.0,
+                    "total_tokens": 200_000,
+                    "remaining_tokens": 150_000,
+                }
+                if sid == session_id
+                else None
+            )
         ),
     )
 
-    snapshot, session_summary, rate_limit_summary = await _resolve_codex_context_snapshot(
-        active_engine=ENGINE_CODEX,
-        session_id=session_id,
-        cli_integration=cli_integration,
-        working_directory=Path("/tmp/project"),
+    snapshot, session_summary, rate_limit_summary = (
+        await _resolve_codex_context_snapshot(
+            active_engine=ENGINE_CODEX,
+            session_id=session_id,
+            cli_integration=cli_integration,
+            working_directory=Path("/tmp/project"),
+        )
     )
 
     assert snapshot is not None
@@ -1214,7 +1260,7 @@ def test_with_engine_badge_handles_empty_body():
     assert text == "🟧 `Claude CLI`"
 
 
-def test_with_engine_badge_falls_back_to_claude_for_unknown_engine():
-    """Unknown engine values should fallback to Claude with orange badge."""
+def test_with_engine_badge_falls_back_to_codex_for_unknown_engine():
+    """Unknown engine values should fallback to Codex with white badge."""
     text = _with_engine_badge("running...", "groq")
-    assert text.startswith("🟧 `Claude CLI`")
+    assert text.startswith("⬜ `Codex CLI`")
