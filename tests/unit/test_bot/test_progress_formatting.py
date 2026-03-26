@@ -567,8 +567,8 @@ def test_get_stream_merge_key_for_mergeable_events():
     assert _get_stream_merge_key(tool_update) is None
 
 
-def test_should_collect_thinking_update_keeps_textual_progress_and_skips_commands():
-    """Thinking details should keep textual progress and skip command/agent final turns."""
+def test_should_collect_thinking_update_keeps_useful_stream_updates():
+    """Thinking details should keep textual progress, command status and narration."""
     assistant_text = _FakeUpdate(
         type="assistant",
         content="draft answer",
@@ -610,15 +610,15 @@ def test_should_collect_thinking_update_keeps_textual_progress_and_skips_command
     assert _should_collect_thinking_update(assistant_text) is True
     assert _should_collect_thinking_update(assistant_empty) is False
     assert _should_collect_thinking_update(assistant_tool) is False
-    assert _should_collect_thinking_update(codex_agent_message) is False
+    assert _should_collect_thinking_update(codex_agent_message) is True
     assert _should_collect_thinking_update(progress_update) is True
     assert _should_collect_thinking_update(reasoning_update) is True
     assert _should_collect_thinking_update(reasoning_empty) is False
-    assert _should_collect_thinking_update(command_progress) is False
+    assert _should_collect_thinking_update(command_progress) is True
     assert _should_collect_thinking_update(system_update) is False
 
 
-def test_cache_thinking_data_filters_command_execution_blocks():
+def test_cache_thinking_data_keeps_command_execution_blocks():
     context = SimpleNamespace(user_data={})
     _cache_thinking_data(
         context,
@@ -633,7 +633,25 @@ def test_cache_thinking_data_filters_command_execution_blocks():
 
     payload = context.user_data["thinking:1001"]
     assert payload["summary"] == "Thinking done"
-    assert payload["lines"] == ["🤔 已定位到根因"]
+    assert payload["lines"] == [
+        "🔧 *Running command*\n\n`/bin/zsh -lc 'pwd'`",
+        "🤔 已定位到根因",
+        "✅ *Command completed* \\(exit 0\\)\n\n`/bin/zsh -lc 'pwd'`",
+    ]
+
+
+def test_cache_thinking_data_falls_back_to_summary_when_lines_empty():
+    context = SimpleNamespace(user_data={})
+    _cache_thinking_data(
+        context,
+        message_id=1002,
+        lines=["", "   "],
+        summary="Thinking done",
+    )
+
+    payload = context.user_data["thinking:1002"]
+    assert payload["summary"] == "Thinking done"
+    assert payload["lines"] == ["Thinking done"]
 
 
 def test_get_stream_merge_key_for_command_execution_uses_command_identity():

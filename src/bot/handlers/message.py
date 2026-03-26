@@ -2077,14 +2077,15 @@ def _should_collect_thinking_update(update_obj: Any) -> bool:
     item_type = str(metadata.get("item_type") or "").strip().lower()
     if update_type == "progress":
         if item_type == "command_execution":
-            return False
-        return bool(content)
+            command = str(metadata.get("command") or content).strip()
+            return bool(command)
+        if content:
+            return True
+        return bool(str(metadata.get("subtype") or "").strip())
 
     if update_type != "assistant":
         return False
     if getattr(update_obj, "tool_calls", None):
-        return False
-    if item_type == "agent_message":
         return False
     return bool(content)
 
@@ -2473,22 +2474,23 @@ def _cache_thinking_data(
     if user_data is None:
         return
 
-    sanitized_lines: list[str] = []
-    fallback_lines: list[str] = []
+    normalized_lines: list[str] = []
     for raw_line in lines:
         normalized = str(raw_line or "").strip()
         if not normalized:
             continue
-        fallback_lines.append(normalized)
-        if _is_command_execution_progress_block(normalized):
-            continue
-        sanitized_lines.append(normalized)
-    if not sanitized_lines:
-        sanitized_lines = fallback_lines
+        normalized_lines.append(normalized)
+    if not normalized_lines:
+        summary_line = str(summary or "").strip()
+        normalized_lines = (
+            [summary_line]
+            if summary_line
+            else ["ℹ️ No detailed thinking trace captured for this request."]
+        )
 
     cache_key = f"thinking:{message_id}"
     user_data[cache_key] = {
-        "lines": sanitized_lines,
+        "lines": normalized_lines,
         "summary": summary,
     }
 
